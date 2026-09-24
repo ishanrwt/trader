@@ -174,16 +174,33 @@ describe("skipReasonStats", () => {
     const stats = skipReasonStats([
       { skipReason: "liquidity", priceAtSkipUsd: 1, price15mUsd: 1.1, price60mUsd: 1.3 }, // +10%, +30%
       { skipReason: "liquidity", priceAtSkipUsd: 2, price15mUsd: 1.8, price60mUsd: 2.4 }, // -10%, +20%
-      { skipReason: "pair", priceAtSkipUsd: 1, price15mUsd: null, price60mUsd: null },
     ]);
     const liquidity = stats.find((s) => s.reason === "liquidity")!;
     expect(liquidity.count).toBe(2);
     expect(liquidity.median15mPctChange).toBeCloseTo(0, 10); // median(10,-10)
     expect(liquidity.median60mPctChange).toBeCloseTo(25, 10); // median(30,20)
+  });
 
+  it("reports null (missing), not 0%, when no mint in the group has a price at that offset", () => {
+    const stats = skipReasonStats([
+      { skipReason: "pair", priceAtSkipUsd: 1, price15mUsd: null, price60mUsd: null },
+      { skipReason: "pair", priceAtSkipUsd: null, price15mUsd: null, price60mUsd: null }, // never even had a skip-time price
+    ]);
     const pair = stats.find((s) => s.reason === "pair")!;
-    expect(pair.count).toBe(1);
-    expect(pair.median15mPctChange).toBe(0); // no priced data -> empty median, not NaN
+    expect(pair.count).toBe(2);
+    expect(pair.median15mPctChange).toBeNull();
+    expect(pair.median60mPctChange).toBeNull();
+  });
+
+  it("excludes only the missing readings from the median, keeping the priced ones when the group is mixed", () => {
+    const stats = skipReasonStats([
+      { skipReason: "pair", priceAtSkipUsd: 1, price15mUsd: 1.2, price60mUsd: null }, // +20% at 15m, no 60m reading
+      { skipReason: "pair", priceAtSkipUsd: 1, price15mUsd: null, price60mUsd: null }, // no reading at all
+    ]);
+    const pair = stats.find((s) => s.reason === "pair")!;
+    expect(pair.count).toBe(2);
+    expect(pair.median15mPctChange).toBeCloseTo(20, 10); // the one priced reading, not diluted by the missing one
+    expect(pair.median60mPctChange).toBeNull(); // neither mint has a 60m price
   });
 });
 
@@ -220,5 +237,17 @@ describe("formatReport", () => {
     expect(text).toContain("By exit reason:");
     expect(text).toContain("Go-live checklist:");
     expect(text).toContain("[PASS]");
+  });
+
+  it("shows 'n/a' for a skip reason with no priced mints, not 0.0%", () => {
+    const text = formatReport({
+      trades: DATASET,
+      paperTrades: DATASET,
+      skipTracks: [{ skipReason: "pair", priceAtSkipUsd: 1, price15mUsd: null, price60mUsd: null }],
+      hasStuckPositions: false,
+      goLiveConfig: { minTrades: 4, minDays: 0, minMedianPnlPct: 0, minTotalPnlUsd: -1, minP10PnlPct: -50 },
+    });
+    expect(text).toContain("pair(n=1, +15m=n/a, +60m=n/a)");
+    expect(text).not.toContain("+15m=0.0%");
   });
 });

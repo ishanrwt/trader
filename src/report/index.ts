@@ -210,8 +210,16 @@ export interface SkipTrackRecord {
 export interface SkipReasonStat {
   reason: string;
   count: number;
-  median15mPctChange: number;
-  median60mPctChange: number;
+  /** null when no mint in this group has a priced +15m reading (e.g. it never had a valid pair) — distinct from a genuine 0% change. */
+  median15mPctChange: number | null;
+  /** null when no mint in this group has a priced +60m reading. */
+  median60mPctChange: number | null;
+}
+
+/** Median of the non-null pct-change readings, or null if none of them have a price at all (not the same as a 0% change). */
+function medianOrMissing(values: readonly (number | null)[]): number | null {
+  const priced = values.filter((v): v is number => v !== null);
+  return priced.length > 0 ? median(priced) : null;
 }
 
 /** SPEC.md section 11.4: skipped tokens, median +15/+60 price change by skip reason. */
@@ -226,8 +234,8 @@ export function skipReasonStats(rows: readonly SkipTrackRecord[]): SkipReasonSta
   return [...byReason.entries()].map(([reason, rs]) => ({
     reason,
     count: rs.length,
-    median15mPctChange: median(rs.map((r) => pctChange(r.priceAtSkipUsd, r.price15mUsd)).filter((v): v is number => v !== null)),
-    median60mPctChange: median(rs.map((r) => pctChange(r.priceAtSkipUsd, r.price60mUsd)).filter((v): v is number => v !== null)),
+    median15mPctChange: medianOrMissing(rs.map((r) => pctChange(r.priceAtSkipUsd, r.price15mUsd))),
+    median60mPctChange: medianOrMissing(rs.map((r) => pctChange(r.priceAtSkipUsd, r.price60mUsd))),
   }));
 }
 
@@ -273,8 +281,9 @@ export function formatReport(input: {
     `Component correlations: buyPressure=${correlations.buyPressure.toFixed(2)}, activity=${correlations.activity.toFixed(2)}, ` +
       `momentum=${correlations.momentum.toFixed(2)}, depth=${correlations.depth.toFixed(2)}, holders=${correlations.holders.toFixed(2)}, freshness=${correlations.freshness.toFixed(2)}`,
   );
+  const fmtSkipPct = (v: number | null): string => (v === null ? "n/a" : `${v.toFixed(1)}%`);
   lines.push(
-    `Skip reasons: ${skipStats.map((s) => `${s.reason}(n=${s.count}, +15m=${s.median15mPctChange.toFixed(1)}%, +60m=${s.median60mPctChange.toFixed(1)}%)`).join(", ") || "none"}`,
+    `Skip reasons: ${skipStats.map((s) => `${s.reason}(n=${s.count}, +15m=${fmtSkipPct(s.median15mPctChange)}, +60m=${fmtSkipPct(s.median60mPctChange)})`).join(", ") || "none"}`,
   );
   lines.push("Go-live checklist:");
   for (const item of checklist) lines.push(`  [${item.pass ? "PASS" : "FAIL"}] ${item.check} (${item.detail})`);
