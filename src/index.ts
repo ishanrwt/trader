@@ -22,7 +22,7 @@ import { sleep as sleepMs } from "./limiters/clock.js";
 import { SlidingWindowLimiter } from "./limiters/slidingWindow.js";
 import { createLogger, type Logger, type LogLevel } from "./logger/index.js";
 import { pollOpenPositions, triggerFireAndForget, type PollPositionInput } from "./monitor/index.js";
-import { initialExitState, type ExitState, type ExitStateMachineConfig } from "./monitor/stateMachine.js";
+import { finalPeakPnl, initialExitState, type ExitState, type ExitStateMachineConfig } from "./monitor/stateMachine.js";
 import {
   CONSECUTIVE_ERRORS_KEY,
   KILLED_VIA_COMMAND_KEY,
@@ -55,6 +55,7 @@ import { PostExitTracksStore } from "./storage/postExitTracks.js";
 import { SkipTracksStore } from "./storage/skipTracks.js";
 import { StateStore } from "./storage/state.js";
 import { TradesStore } from "./storage/trades.js";
+import { TradeHistoryStore } from "./storage/tradeHistory.js";
 import { paperEntryFill, paperExitFill, shouldWriteOff } from "./executor/paper.js";
 import { shadowEntry, shadowStep, shadowValue } from "./tracking/shadows.js";
 import { dueOffsetMinutes as skipDueOffset, isSkipTrackResolved } from "./tracking/skipTracking.js";
@@ -164,6 +165,7 @@ async function main(): Promise<void> {
   const pendingStore = new PendingStore(db);
   const positionsStore = new PositionsStore(db);
   const tradesStore = new TradesStore(db);
+  const tradeHistoryStore = new TradeHistoryStore(db);
   const shadowsStore = new ShadowsStore(db);
   const skipTracksStore = new SkipTracksStore(db);
   const postExitTracksStore = new PostExitTracksStore(db);
@@ -603,6 +605,8 @@ async function main(): Promise<void> {
     const readyRow = pendingStore.listReady().find((r) => r.mint === candidate.mint);
     const snap = readyRow?.snapshot ? (JSON.parse(readyRow.snapshot) as { pair: DexPair; holders: HoldersResult; score: number; components: unknown }) : null;
 
+    let entryQuoteInAmount: string | null = null;
+    let entryQuoteOutAmount: string | null = null;
     const fill = await paperEntryFill(
       execution.sizeUsd,
       async () => {
@@ -610,6 +614,8 @@ async function main(): Promise<void> {
           await acquireEntryLane();
           const usdcAmount = Math.round(execution.sizeUsd * 10 ** USDC_DECIMALS).toString();
           const quote = await jupiterClient.getQuote({ inputMint: USDC_MINT, outputMint: candidate.mint, amount: usdcAmount, slippageBps: config.BUY_SLIPPAGE_BPS });
+          entryQuoteInAmount = quote.inAmount;
+          entryQuoteOutAmount = quote.outAmount;
           const decimals = mintDecimalsCache.get(candidate.mint) ?? 6;
           return { tokensOut: Number(quote.outAmount) / 10 ** decimals };
         } catch {
@@ -629,7 +635,32 @@ async function main(): Promise<void> {
     wallet.debit(fill.costBasis);
 
     const now = Date.now();
-    const state = initialExitState({ entryTime: now, entryLiquidity: candidate.liquidityUsd, targetProfitPct: config.TARGET_PROFIT_PCT, holdMinutes: config.HOLD_MINUTES });
+    const tokenDecimals = mintDecimalsCache.get(candidate.mint) ?? null;
+
+    // The true entry-time mark (SPEC.md section 8.1): a just-opened position is typically
+    // already below zero (round-trip fees, price impact, simulated slippage), never assumed
+    // to be exactly 0%. Fetched via the exit lane, same as every later poll.
+    let entryValuationPnlPct: number | null = null;
+    try {
+      const decimals = tokenDecimals ?? 6;
+      const exitAmount = Math.round(fill.tokens * 10 ** decimals).toString();
+      jupiterLaneBudget.recordExit(now); // exit lane: never gated
+      const exitQuote = await jupiterClient.getQuote({ inputMint: candidate.mint, outputMint: USDC_MINT, amount: exitAmount, slippageBps: 300 });
+      const quoteOutUsd = Number(exitQuote.outAmount) / 10 ** USDC_DECIMALS;
+      const valueUsd = quoteOutUsd - config.PAPER_FEE_USD_PER_TX;
+      entryValuationPnlPct = ((valueUsd - fill.costBasis) / fill.costBasis) * 100;
+    } catch (err) {
+      logger.warn("Entry valuation exit-lane quote failed; first history point deferred to the first regular poll", { mint: candidate.mint, error: String(err) });
+    }
+
+    const state = initialExitState({
+      entryTime: now,
+      entryLiquidity: candidate.liquidityUsd,
+      targetProfitPct: config.TARGET_PROFIT_PCT,
+      holdMinutes: config.HOLD_MINUTES,
+      entryPnlPct: entryValuationPnlPct,
+    });
+    const entryValueUsd = entryValuationPnlPct !== null ? fill.costBasis * (1 + entryValuationPnlPct / 100) : fill.costBasis;
     const id = positionsStore.insert({
       mode: config.MODE,
       mint: candidate.mint,
@@ -658,11 +689,15 @@ async function main(): Promise<void> {
       noRouteSince: state.noRouteSince,
       closingSince: null,
       pendingExitReason: null,
-      lastPnlPct: 0,
-      lastValueUsd: fill.costBasis,
+      lastPnlPct: entryValuationPnlPct,
+      lastValueUsd: entryValueUsd,
       lastPolledAt: now,
+      tokenDecimals,
+      entryValuationPnlPct,
+      entryQuoteInAmount,
+      entryQuoteOutAmount,
     });
-    positionsStore.appendHistory(id, state.history[0]!);
+    if (state.history.length > 0) positionsStore.appendHistory(id, state.history[0]!);
     pendingStore.removePending(candidate.mint); // bought (section 4)
 
     const shadow = shadowsStore.getOpenByMint(candidate.mint);
@@ -764,13 +799,17 @@ async function main(): Promise<void> {
    * triggerExitFillAttempt is what turns that into a logged, counted, non-crashing outcome.
    */
   async function attemptExitFill(row: ReturnType<PositionsStore["listClosing"]>[number]): Promise<void> {
+    let exitQuoteInAmount: string | null = null;
+    let exitQuoteOutAmount: string | null = null;
     const fill = await paperExitFill(
       async () => {
         try {
-          const decimals = mintDecimalsCache.get(row.mint) ?? 6;
+          const decimals = row.tokenDecimals ?? mintDecimalsCache.get(row.mint) ?? 6;
           const amount = Math.round(row.tokenAmount * 10 ** decimals).toString();
           jupiterLaneBudget.recordExit(Date.now());
           const quote = await jupiterClient.getQuote({ inputMint: row.mint, outputMint: USDC_MINT, amount, slippageBps: 300 });
+          exitQuoteInAmount = quote.inAmount;
+          exitQuoteOutAmount = quote.outAmount;
           return { usdcOut: Number(quote.outAmount) / 10 ** USDC_DECIMALS };
         } catch {
           return null; // no route this attempt; not an error — retried by the next trigger
@@ -780,7 +819,7 @@ async function main(): Promise<void> {
     );
 
     if (fill) {
-      await finalizeTrade(row, fill.proceeds, row.pendingExitReason ?? "time_exit");
+      await finalizeTrade(row, fill.proceeds, row.pendingExitReason ?? "time_exit", { exitQuoteInAmount, exitQuoteOutAmount });
       return;
     }
 
@@ -789,7 +828,7 @@ async function main(): Promise<void> {
       if (config.URGENT_ALERTS) {
         await telegram.sendMessage(buildStuckSellMessage({ mint: row.mint, ...(row.symbol ? { symbol: row.symbol } : {}), reason: "written_off" }));
       }
-      await finalizeTrade(row, 0, "written_off");
+      await finalizeTrade(row, 0, "written_off", { exitQuoteInAmount: null, exitQuoteOutAmount: null });
     }
     // else: still closing, no route yet — retried by the next pollClosingPositionsTick sweep.
   }
@@ -817,7 +856,12 @@ async function main(): Promise<void> {
     for (const row of rows) triggerExitFillAttempt(row);
   }
 
-  async function finalizeTrade(row: ReturnType<PositionsStore["listClosing"]>[number], proceeds: number, exitReason: string): Promise<void> {
+  async function finalizeTrade(
+    row: ReturnType<PositionsStore["listClosing"]>[number],
+    proceeds: number,
+    exitReason: string,
+    exitQuote: { exitQuoteInAmount: string | null; exitQuoteOutAmount: string | null },
+  ): Promise<void> {
     const now = Date.now();
     wallet.credit(proceeds);
     const netPnlUsd = proceeds - row.costBasis;
@@ -840,7 +884,7 @@ async function main(): Promise<void> {
       netPnlUsd,
       netPnlPct,
       exitReason,
-      peakPnl: row.peakPnl,
+      peakPnl: finalPeakPnl(row.peakPnl, netPnlPct),
       timerRestarts: row.timerRestarts,
       targetExtensions: row.targetExtensions,
       feesUsd: config.PAPER_FEE_USD_PER_TX * 2,
@@ -851,7 +895,19 @@ async function main(): Promise<void> {
       scoreComponents: row.scoreComponents,
       animalFlag: null,
       tradingDay,
+      tokenAmount: row.tokenAmount,
+      tokenDecimals: row.tokenDecimals,
+      entryValuationPnlPct: row.entryValuationPnlPct,
+      entryQuoteInAmount: row.entryQuoteInAmount,
+      entryQuoteOutAmount: row.entryQuoteOutAmount,
+      exitQuoteInAmount: exitQuote.exitQuoteInAmount,
+      exitQuoteOutAmount: exitQuote.exitQuoteOutAmount,
     });
+
+    // Preserve position_history past the close (SPEC.md sections 11.1/12) — copied, not
+    // deleted, before positionsStore.remove() deletes the live position_history rows.
+    const history = positionsStore.loadHistory(row.id, 0);
+    if (history.length > 0) tradeHistoryStore.insertMany(tradeId, history);
 
     positionsStore.remove(row.id);
     lastValueUsdByPosition.delete(row.id);

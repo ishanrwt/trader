@@ -1,16 +1,17 @@
 import path from "node:path";
 import { loadEnv } from "../config/loadEnv.js";
 import { loadReportConfig, ReportConfigError } from "../config/reportConfig.js";
-import { formatReport, type TradeRecord } from "./index.js";
+import { formatReport, formatTradeDetail, type TradeDetailRecord, type TradeRecord } from "./index.js";
 import { openDb } from "../storage/db.js";
 import { TradesStore } from "../storage/trades.js";
+import { TradeHistoryStore } from "../storage/tradeHistory.js";
 import { SkipTracksStore } from "../storage/skipTracks.js";
 import { PositionsStore } from "../storage/positions.js";
 import { shouldWriteOff } from "../executor/paper.js";
 import type { DexPair } from "../types.js";
 
-function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to?: string; db?: string } {
-  const out: { mode?: "paper" | "live"; from?: string; to?: string; db?: string } = {};
+function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to?: string; db?: string; trades?: boolean } {
+  const out: { mode?: "paper" | "live"; from?: string; to?: string; db?: string; trades?: boolean } = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--mode") {
@@ -25,6 +26,8 @@ function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to
     } else if (arg === "--db") {
       const value = argv[++i];
       if (value) out.db = value;
+    } else if (arg === "--trades") {
+      out.trades = true;
     }
   }
   return out;
@@ -52,8 +55,42 @@ function main(): void {
   const db = openDb(dbPath);
 
   const tradesStore = new TradesStore(db);
+  const tradeHistoryStore = new TradeHistoryStore(db);
   const skipTracksStore = new SkipTracksStore(db);
   const positionsStore = new PositionsStore(db);
+
+  if (opts.trades) {
+    const rows = tradesStore.listAll({ ...(opts.mode ? { mode: opts.mode } : {}), ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) });
+    const detail: TradeDetailRecord[] = rows.map((t) => {
+      const snapshot = t.entryPairSnapshot as DexPair | null;
+      return {
+        id: t.id,
+        mint: t.mint,
+        symbol: t.symbol,
+        entryTime: t.entryTime,
+        exitTime: t.exitTime,
+        sizeUsd: t.sizeUsd,
+        costBasis: t.costBasis,
+        tokenAmount: t.tokenAmount,
+        tokenDecimals: t.tokenDecimals,
+        proceeds: t.proceeds,
+        netPnlUsd: t.netPnlUsd,
+        netPnlPct: t.netPnlPct,
+        peakPnl: t.peakPnl,
+        exitReason: t.exitReason,
+        entryLiquidityUsd: snapshot?.liquidity?.usd ?? null,
+        entryValuationPnlPct: t.entryValuationPnlPct,
+        entryQuoteInAmount: t.entryQuoteInAmount,
+        entryQuoteOutAmount: t.entryQuoteOutAmount,
+        exitQuoteInAmount: t.exitQuoteInAmount,
+        exitQuoteOutAmount: t.exitQuoteOutAmount,
+        history: tradeHistoryStore.listForTrade(t.id),
+      };
+    });
+    console.log(formatTradeDetail(detail));
+    db.close();
+    return;
+  }
 
   function toRecords(mode?: "paper" | "live", from?: string, to?: string): TradeRecord[] {
     return tradesStore.listAll({ ...(mode ? { mode } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}) }).map((t) => {

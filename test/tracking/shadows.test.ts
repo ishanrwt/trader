@@ -53,7 +53,7 @@ describe("shadow cost math (hand-checked)", () => {
 });
 
 describe("shadowStep", () => {
-  const state = initialExitState({ entryTime: 0, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15 });
+  const state = initialExitState({ entryTime: 0, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15, entryPnlPct: 0 });
 
   it("never asks for a second quote: a stop-loss reading resolves in one call", () => {
     const result = shadowStep(state, { now: 1000, pnlPct: -20 }, CFG); // would be NEED_CONFIRM for a real position

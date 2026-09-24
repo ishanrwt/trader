@@ -76,12 +76,16 @@ keys.
 ```sh
 npm run report                                  # everything
 npm run report -- --mode paper --from 2026-01-01 --to 2026-01-31
+npm run report -- --trades                      # per-trade detail instead of aggregates
 ```
 
 Same output as the `/report` Telegram command: totals, breakdowns by exit reason and
 trading day, score-quintile and entry-feature results, score-component correlations,
 shadow comparisons, "exited too early," skip-reason stats, and the go-live checklist
-(paper trades only).
+(paper trades only). `--trades` prints every field a closed trade stores per section
+11.1 — cost basis, tokens received and decimals, entry valuation, the raw Jupiter quote
+amounts for the entry and exit fills, and the first 5 `trade_history` points — for
+debugging a specific trade rather than reading aggregate stats.
 
 ## Test
 

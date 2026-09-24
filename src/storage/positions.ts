@@ -34,6 +34,13 @@ export interface PositionRow {
   lastPnlPct: number | null;
   lastValueUsd: number | null;
   lastPolledAt: number | null;
+  /** The mint's decimals, as read from getTokenSupply at whatever point it was learned (holders check or the entry fill's quote). Null if never learned. */
+  tokenDecimals: number | null;
+  /** pnlPct from the first exit-lane quote fetched immediately after the entry fill (SPEC.md section 8.1's true entry-time mark) — null if that quote failed. */
+  entryValuationPnlPct: number | null;
+  /** Raw (pre-decimal-adjustment) Jupiter quote amounts for the entry fill, as returned by the API (large-integer strings). */
+  entryQuoteInAmount: string | null;
+  entryQuoteOutAmount: string | null;
 }
 
 interface PositionRowDb {
@@ -68,6 +75,10 @@ interface PositionRowDb {
   last_pnl_pct: number | null;
   last_value_usd: number | null;
   last_polled_at: number | null;
+  token_decimals: number | null;
+  entry_valuation_pnl_pct: number | null;
+  entry_quote_in_amount: string | null;
+  entry_quote_out_amount: string | null;
 }
 
 function fromDb(row: PositionRowDb): PositionRow {
@@ -103,11 +114,18 @@ function fromDb(row: PositionRowDb): PositionRow {
     lastPnlPct: row.last_pnl_pct,
     lastValueUsd: row.last_value_usd,
     lastPolledAt: row.last_polled_at,
+    tokenDecimals: row.token_decimals,
+    entryValuationPnlPct: row.entry_valuation_pnl_pct,
+    entryQuoteInAmount: row.entry_quote_in_amount,
+    entryQuoteOutAmount: row.entry_quote_out_amount,
   };
 }
 
 export type NewPositionRow = Omit<PositionRow, "id">;
-export type PositionPatch = Partial<Omit<PositionRow, "id" | "mode" | "mint" | "entryTime">>;
+/** tokenDecimals/entryValuationPnlPct/entryQuote* are write-once at insert time, like mode/mint/entryTime — update() never touches them. */
+export type PositionPatch = Partial<
+  Omit<PositionRow, "id" | "mode" | "mint" | "entryTime" | "tokenDecimals" | "entryValuationPnlPct" | "entryQuoteInAmount" | "entryQuoteOutAmount">
+>;
 
 /** DB access for `positions` and `position_history` (SPEC.md section 12). */
 export class PositionsStore {
@@ -120,11 +138,13 @@ export class PositionsStore {
           mode, mint, symbol, pair_address, status, entry_time, size_usd, token_amount, cost_basis,
           entry_liquidity_usd, entry_pair_snapshot, score, score_components, safety_result, holders_result,
           peak_pnl, current_target, target_extensions, timer_restarts, last_restart_at, deadline,
-          trail_armed, fast_streak, low_liq_streak, no_route_since, closing_since, pending_exit_reason, last_pnl_pct, last_value_usd, last_polled_at
+          trail_armed, fast_streak, low_liq_streak, no_route_since, closing_since, pending_exit_reason, last_pnl_pct, last_value_usd, last_polled_at,
+          token_decimals, entry_valuation_pnl_pct, entry_quote_in_amount, entry_quote_out_amount
         ) VALUES (@mode, @mint, @symbol, @pair_address, @status, @entry_time, @size_usd, @token_amount, @cost_basis,
           @entry_liquidity_usd, @entry_pair_snapshot, @score, @score_components, @safety_result, @holders_result,
           @peak_pnl, @current_target, @target_extensions, @timer_restarts, @last_restart_at, @deadline,
-          @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @closing_since, @pending_exit_reason, @last_pnl_pct, @last_value_usd, @last_polled_at)`,
+          @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @closing_since, @pending_exit_reason, @last_pnl_pct, @last_value_usd, @last_polled_at,
+          @token_decimals, @entry_valuation_pnl_pct, @entry_quote_in_amount, @entry_quote_out_amount)`,
       )
       .run({
         mode: row.mode,
@@ -157,6 +177,10 @@ export class PositionsStore {
         last_pnl_pct: row.lastPnlPct,
         last_value_usd: row.lastValueUsd,
         last_polled_at: row.lastPolledAt,
+        token_decimals: row.tokenDecimals,
+        entry_valuation_pnl_pct: row.entryValuationPnlPct,
+        entry_quote_in_amount: row.entryQuoteInAmount,
+        entry_quote_out_amount: row.entryQuoteOutAmount,
       });
     return Number(info.lastInsertRowid);
   }

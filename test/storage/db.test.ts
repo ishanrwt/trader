@@ -18,6 +18,7 @@ describe("openDb / runMigrations", () => {
         "skip_tracks",
         "post_exit_tracks",
         "safety_cache",
+        "trade_history",
       ]),
     );
     db.close();
@@ -25,7 +26,7 @@ describe("openDb / runMigrations", () => {
 
   it("sets PRAGMA user_version to the latest migration number", () => {
     const db = openDb(":memory:");
-    expect(db.pragma("user_version", { simple: true })).toBe(2);
+    expect(db.pragma("user_version", { simple: true })).toBe(3);
     db.close();
   });
 
@@ -33,7 +34,7 @@ describe("openDb / runMigrations", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     expect(() => runMigrations(db)).not.toThrow();
-    expect(db.pragma("user_version", { simple: true })).toBe(2);
+    expect(db.pragma("user_version", { simple: true })).toBe(3);
     db.close();
   });
 

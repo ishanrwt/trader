@@ -31,6 +31,13 @@ function newTrade(overrides: Partial<NewTradeRow> = {}): NewTradeRow {
     scoreComponents: null,
     animalFlag: null,
     tradingDay: "2026-01-01",
+    tokenAmount: 1000,
+    tokenDecimals: 6,
+    entryValuationPnlPct: -1.5,
+    entryQuoteInAmount: null,
+    entryQuoteOutAmount: null,
+    exitQuoteInAmount: null,
+    exitQuoteOutAmount: null,
     ...overrides,
   };
 }
@@ -43,6 +50,44 @@ describe("TradesStore", () => {
     expect(store.listAll().length).toBe(2);
     expect(store.listAll({ from: "2026-01-02" }).length).toBe(1);
     expect(store.listForTradingDay("2026-01-01").length).toBe(1);
+  });
+
+  it("round-trips tokens received, decimals, entry valuation, and raw quote amounts (in/out for both entry and exit)", () => {
+    const store = new TradesStore(openDb(":memory:"));
+    const id = store.insert(
+      newTrade({
+        tokenAmount: 68_306.48291,
+        tokenDecimals: 6,
+        entryValuationPnlPct: -3.2,
+        entryQuoteInAmount: "25000000",
+        entryQuoteOutAmount: "68306482910",
+        exitQuoteInAmount: "68306482910",
+        exitQuoteOutAmount: "19853020",
+      }),
+    );
+    const row = store.get(id)!;
+    expect(row.tokenAmount).toBeCloseTo(68_306.48291, 6);
+    expect(row.tokenDecimals).toBe(6);
+    expect(row.entryValuationPnlPct).toBe(-3.2);
+    expect(row.entryQuoteInAmount).toBe("25000000");
+    expect(row.entryQuoteOutAmount).toBe("68306482910");
+    expect(row.exitQuoteInAmount).toBe("68306482910");
+    expect(row.exitQuoteOutAmount).toBe("19853020");
+  });
+
+  it("allows null tokenAmount/decimals/quote amounts (e.g. a written_off trade with no exit quote)", () => {
+    const store = new TradesStore(openDb(":memory:"));
+    const id = store.insert(
+      newTrade({ tokenAmount: null, tokenDecimals: null, exitQuoteInAmount: null, exitQuoteOutAmount: null, exitReason: "written_off" }),
+    );
+    const row = store.get(id)!;
+    expect(row.exitQuoteInAmount).toBeNull();
+    expect(row.exitQuoteOutAmount).toBeNull();
+  });
+
+  it("get() returns undefined for a missing id", () => {
+    const store = new TradesStore(openDb(":memory:"));
+    expect(store.get(999)).toBeUndefined();
   });
 });
 

@@ -34,6 +34,10 @@ function newRow(overrides: Partial<NewPositionRow> = {}): NewPositionRow {
     lastPnlPct: null,
     lastValueUsd: null,
     lastPolledAt: null,
+    tokenDecimals: null,
+    entryValuationPnlPct: null,
+    entryQuoteInAmount: null,
+    entryQuoteOutAmount: null,
     ...overrides,
   };
 }
@@ -46,6 +50,28 @@ describe("PositionsStore", () => {
     expect(row.mint).toBe("MINT1");
     expect(row.entryPairSnapshot).toEqual({ liquidityUsd: 20_000 });
     expect(row.trailArmed).toBe(false);
+  });
+
+  it("round-trips the entry-valuation and raw-quote-amount fields, including a negative pnlPct and null (quote failed)", () => {
+    const store = new PositionsStore(openDb(":memory:"));
+    const id = store.insert(newRow({ tokenDecimals: 6, entryValuationPnlPct: -3.2, entryQuoteInAmount: "25000000", entryQuoteOutAmount: "68306482910" }));
+    const row = store.get(id)!;
+    expect(row.tokenDecimals).toBe(6);
+    expect(row.entryValuationPnlPct).toBe(-3.2);
+    expect(row.entryQuoteInAmount).toBe("25000000");
+    expect(row.entryQuoteOutAmount).toBe("68306482910");
+
+    const id2 = store.insert(newRow({ mint: "MINT2", tokenDecimals: null, entryValuationPnlPct: null, entryQuoteInAmount: null, entryQuoteOutAmount: null }));
+    const row2 = store.get(id2)!;
+    expect(row2.tokenDecimals).toBeNull();
+    expect(row2.entryValuationPnlPct).toBeNull();
+  });
+
+  it("update() never touches the write-once entry-valuation/raw-quote fields", () => {
+    const store = new PositionsStore(openDb(":memory:"));
+    const id = store.insert(newRow({ entryValuationPnlPct: -3.2 }));
+    store.update(id, { peakPnl: 10 });
+    expect(store.get(id)!.entryValuationPnlPct).toBe(-3.2);
   });
 
   it("lists open vs closing positions separately", () => {

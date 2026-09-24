@@ -7,11 +7,13 @@ import {
   computeTotals,
   exitedTooEarly,
   formatReport,
+  formatTradeDetail,
   goLiveChecklist,
   quantileBuckets,
   scoreComponentCorrelations,
   skipReasonStats,
   type ShadowRecord,
+  type TradeDetailRecord,
   type TradeRecord,
 } from "../../src/report/index.js";
 
@@ -249,5 +251,88 @@ describe("formatReport", () => {
     });
     expect(text).toContain("pair(n=1, +15m=n/a, +60m=n/a)");
     expect(text).not.toContain("+15m=0.0%");
+  });
+});
+
+function tradeDetail(overrides: Partial<TradeDetailRecord> = {}): TradeDetailRecord {
+  return {
+    id: 1,
+    mint: "MINT1111111111111111111111111111111111111",
+    symbol: "FOO",
+    entryTime: 1_000,
+    exitTime: 42_404,
+    sizeUsd: 25,
+    costBasis: 25.05,
+    tokenAmount: 68_306.48291,
+    tokenDecimals: 6,
+    proceeds: 19.85302,
+    netPnlUsd: -5.19698,
+    netPnlPct: -20.746,
+    peakPnl: -3.2,
+    exitReason: "stop",
+    entryLiquidityUsd: 54_801.61,
+    entryValuationPnlPct: -3.2,
+    entryQuoteInAmount: "25000000",
+    entryQuoteOutAmount: "68306482910",
+    exitQuoteInAmount: "68306482910",
+    exitQuoteOutAmount: "19853020",
+    history: [
+      { t: 1000, pnl: -3.2 },
+      { t: 11000, pnl: -5.1 },
+      { t: 21000, pnl: -12.4 },
+    ],
+    ...overrides,
+  };
+}
+
+describe("formatTradeDetail", () => {
+  it("renders every field for a fully-populated trade, including hold duration and raw quote amounts", () => {
+    const text = formatTradeDetail([tradeDetail()]);
+    expect(text).toContain("=== Trade 1: FOO (MINT1111111111111111111111111111111111111) ===");
+    expect(text).toContain("hold: 41.4s"); // (42404-1000)/1000
+    expect(text).toContain("tokens received: 68306.48291  decimals: 6");
+    expect(text).toContain("entry valuation (first exit-lane quote after fill): -3.20%");
+    expect(text).toContain("entry quote (raw): in=25000000 out=68306482910");
+    expect(text).toContain("exit quote (raw): in=68306482910 out=19853020");
+    expect(text).toContain("history (first 5 of 3): (1000, -3.20%), (11000, -5.10%), (21000, -12.40%)");
+  });
+
+  it("shows n/a for missing entry valuation, quote amounts, and history — never a crash", () => {
+    const text = formatTradeDetail([
+      tradeDetail({
+        tokenAmount: null,
+        tokenDecimals: null,
+        entryValuationPnlPct: null,
+        entryQuoteInAmount: null,
+        entryQuoteOutAmount: null,
+        exitQuoteInAmount: null,
+        exitQuoteOutAmount: null,
+        entryLiquidityUsd: null,
+        history: [],
+      }),
+    ]);
+    expect(text).toContain("tokens received: n/a  decimals: n/a");
+    expect(text).toContain("entry valuation (first exit-lane quote after fill): n/a");
+    expect(text).toContain("entry quote (raw): n/a (no successful quote)");
+    expect(text).toContain("entry liquidity: n/a");
+    expect(text).toContain("history (first 5 of 0): none");
+  });
+
+  it("shows n/a for a non-finite peak (the -Infinity sentinel, in case it's ever seen raw)", () => {
+    const text = formatTradeDetail([tradeDetail({ peakPnl: Number.NEGATIVE_INFINITY })]);
+    expect(text).toContain("peak: n/a");
+  });
+
+  it("truncates history to the requested count and notes how many more there are", () => {
+    const text = formatTradeDetail(
+      [tradeDetail({ history: [{ t: 1, pnl: 1 }, { t: 2, pnl: 2 }, { t: 3, pnl: 3 }] })],
+      { historyPoints: 2 },
+    );
+    expect(text).toContain("history (first 2 of 3): (1, 1.00%), (2, 2.00%), +1 more");
+  });
+
+  it("handles multiple trades and an empty list", () => {
+    expect(formatTradeDetail([tradeDetail({ id: 1 }), tradeDetail({ id: 2 })])).toContain("Trade 1:");
+    expect(formatTradeDetail([])).toBe("No trades.");
   });
 });

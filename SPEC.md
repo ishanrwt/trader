@@ -134,7 +134,7 @@ Never close an open position to make room for a candidate.
 
 ### 8.1 Loops
 
-- Every `POLL_SECONDS` per open position: Jupiter sell quote for the full token amount (exit lane). `valueUsd` = quoteOut − estimated exit fee (`PAPER_FEE_USD_PER_TX` in paper; priority + base fee in USD in live). `pnlPct` = (valueUsd − costBasis) / costBasis × 100. The first history point is recorded at entry.
+- Every `POLL_SECONDS` per open position: Jupiter sell quote for the full token amount (exit lane). `valueUsd` = quoteOut − estimated exit fee (`PAPER_FEE_USD_PER_TX` in paper; priority + base fee in USD in live). `pnlPct` = (valueUsd − costBasis) / costBasis × 100. Immediately after the entry fill, one exit-lane quote is fetched the same way and its `pnlPct` becomes the first history point and the initial peak PnL — never assumed to be 0% (round-trip fees, price impact and simulated slippage typically put a just-opened position slightly below zero already). If that quote fails, no history point is fabricated; history starts empty and the first regular poll becomes history's first point.
 - Every `LIQ_CHECK_SECONDS`: DexScreener pair data for all held mints (batched); pass the latest `liquidity.usd` into the state machine as a new reading.
 
 ### 8.2 Persisted state per position
@@ -215,6 +215,10 @@ Checked before every entry. Open positions are always managed normally, whatever
 
 Every closed trade stores: mode, mint, symbol, pair, entry and exit times, size, cost basis, proceeds, net PnL (USD and %), exit reason, peak PnL, timer restarts, target extensions, all fees, the entry pair snapshot (m5/h1/h24 price change, m5/h1 volume, m5 buys and sells, liquidity, pair age, FDV), top-1 and top-10 share, score and components, and the animal flag (null for now). A win is net PnL USD > 0.
 
+Also stored: tokens received at entry and the mint's decimals (if ever learned); the entry valuation's `pnlPct` (section 8.1's first exit-lane quote after the fill, null if that quote failed); and the raw, pre-decimal-adjustment Jupiter quote amounts (`inAmount`/`outAmount`, as the large-integer strings the API returns) for both the entry fill and the exit fill, so raw vs. decimal-adjusted amounts can be checked against each other after the fact. Peak PnL is never persisted below the trade's own final net PnL % — a trade can't have a lower peak than the value it closed at.
+
+A trade's `position_history` (section 8.2) is copied into `trade_history` (not deleted) when the position closes, so it survives past the position row's removal.
+
 ### 11.2 Shadow positions (`SHADOW_ENABLED`)
 
 - Every mint gets a shadow position the first time it becomes READY, whether or not it's later bought. Shadows are marked `selected` when a real or paper position opens for that mint, and `unsellable` if the mint fails the sellability check (excluded from comparisons).
@@ -230,6 +234,8 @@ Every closed trade stores: mode, mint, symbol, pair, entry and exit times, size,
 
 `npm run report -- [--mode paper|live] [--from YYYY-MM-DD] [--to YYYY-MM-DD]` and `/report`:
 
+`npm run report -- --trades [--mode paper|live] [--from YYYY-MM-DD] [--to YYYY-MM-DD]` prints full per-trade detail instead of aggregates: everything section 11.1 stores per trade, plus the first 5 `trade_history` points (t, pnlPct).
+
 - Totals: trades, win rate, median and mean net PnL (% and USD), p10, p90, average win vs average loss, total net PnL, max drawdown of cumulative PnL.
 - Breakdowns by exit reason and by trading day.
 - Results by entry-feature quantile buckets (m5, h1, buy pressure, liquidity, pair age, top-10 share).
@@ -241,7 +247,7 @@ Every closed trade stores: mode, mint, symbol, pair, entry and exit times, size,
 
 ## 12. Storage
 
-SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks, virtual wallet), `events`. The database files are gitignored.
+SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `trade_history` (a closed trade's `position_history`, preserved rather than deleted), `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks, virtual wallet), `events`. The database files are gitignored.
 
 ## 13. Configuration (.env)
 

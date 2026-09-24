@@ -24,7 +24,7 @@ const CFG: ExitStateMachineConfig = {
 };
 
 function state() {
-  return initialExitState({ entryTime: 0, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15 });
+  return initialExitState({ entryTime: 0, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15, entryPnlPct: 0 });
 }
 
 describe("pollPosition", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initialExitState, step, type ExitState, type ExitStateMachineConfig } from "../../src/monitor/stateMachine.js";
+import { finalPeakPnl, initialExitState, step, type ExitState, type ExitStateMachineConfig } from "../../src/monitor/stateMachine.js";
 
 // Spec defaults (SPEC.md section 13).
 const CFG: ExitStateMachineConfig = {
@@ -23,13 +23,67 @@ const CFG: ExitStateMachineConfig = {
 };
 
 function entryState(overrides: Partial<Parameters<typeof initialExitState>[0]> = {}): ExitState {
-  return initialExitState({ entryTime: 0, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15, ...overrides });
+  return initialExitState({ entryTime: 0, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15, entryPnlPct: 0, ...overrides });
 }
+
+describe("initialExitState: entry valuation (SPEC.md section 8.1)", () => {
+  it("records a negative first history point when the entry-valuation sell quote returns less than cost basis", () => {
+    // A caller computes entryPnlPct from a real exit-lane quote fetched right after the
+    // entry fill; round-trip fees/slippage/price-impact typically put this below zero.
+    const s = initialExitState({ entryTime: 5000, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15, entryPnlPct: -3.2 });
+    expect(s.history).toEqual([{ t: 5000, pnl: -3.2 }]);
+    expect(s.peakPnl).toBe(-3.2);
+  });
+
+  it("quote-failure fallback: history starts empty and the first regular poll becomes history[0]", () => {
+    const s = initialExitState({ entryTime: 5000, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15, entryPnlPct: null });
+    expect(s.history).toEqual([]);
+    expect(s.peakPnl).toBe(Number.NEGATIVE_INFINITY); // no reading yet — never a fabricated 0%
+
+    // The first real poll pushes the actual reading and correctly becomes the peak via step 4's
+    // Math.max, whatever its sign — nothing floors it at a guessed starting value.
+    const result = step(s, { now: 20_000, pnlPct: -8 }, CFG);
+    expect(result.newState.history).toEqual([{ t: 20_000, pnl: -8 }]);
+    expect(result.newState.peakPnl).toBe(-8);
+  });
+
+  it("compound edge case: a confirmed stop on the very first real poll (step 4 never runs) leaves peakPnl at -Infinity — finalPeakPnl is what cleans this up before it's ever persisted", () => {
+    const s = initialExitState({ entryTime: 5000, entryLiquidity: 10_000, targetProfitPct: 30, holdMinutes: 15, entryPnlPct: null });
+    const result = step(s, { now: 20_000, pnlPct: -30, confirmPnlPct: -30 }, CFG);
+    expect(result).toMatchObject({ action: "SELL", reason: "stop" });
+    expect(result.newState.peakPnl).toBe(Number.NEGATIVE_INFINITY); // the pure state machine faithfully reports this
+    expect(finalPeakPnl(result.newState.peakPnl, -30)).toBe(-30); // the caller sanitizes it at close time
+  });
+});
+
+describe("finalPeakPnl", () => {
+  it("is a no-op when the recorded peak is already at or above the final pnl", () => {
+    expect(finalPeakPnl(25, 10)).toBe(25);
+    expect(finalPeakPnl(10, 10)).toBe(10);
+  });
+
+  it("raises the peak to the final pnl when the recorded peak understates it (e.g. the -Infinity sentinel)", () => {
+    expect(finalPeakPnl(Number.NEGATIVE_INFINITY, -12.5)).toBe(-12.5);
+    expect(finalPeakPnl(0, 5)).toBe(5); // a HOLD path can't decrease pnl below a prior peak, but this documents the general rule
+  });
+});
 
 describe("exit state machine", () => {
   it("records the first history point at entry (section 8.1)", () => {
     const s = entryState();
     expect(s.history).toEqual([{ t: 0, pnl: 0 }]);
+  });
+
+  it("initializes peakPnl from the first history point, not a separately hardcoded literal", () => {
+    const s = entryState();
+    expect(s.peakPnl).toBe(s.history[0]!.pnl);
+  });
+
+  it("a trade that stops out on its very first confirmed reading (step 4 never runs) reports the entry reading as its peak, not a stale independent value", () => {
+    const s = entryState();
+    const result = step(s, { now: 1000, pnlPct: -30, confirmPnlPct: -30 }, CFG); // confirmed stop-loss on the first call
+    expect(result).toMatchObject({ action: "SELL", reason: "stop" });
+    expect(result.newState.peakPnl).toBe(s.history[0]!.pnl); // still exactly the entry reading (0%), never updated by step 4
   });
 
   it("target hit while not fast -> SELL target", () => {

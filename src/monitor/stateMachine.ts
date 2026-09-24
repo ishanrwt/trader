@@ -194,12 +194,34 @@ export function step(state: ExitState, inputs: ExitStateMachineInputs, cfg: Exit
   return { action: "HOLD", newState: s, logs };
 }
 
-/** SPEC.md section 8.2's initial state, and 8.1's "the first history point is recorded at entry." */
-export function initialExitState(opts: { entryTime: number; entryLiquidity: number; targetProfitPct: number; holdMinutes: number }): ExitState {
+/**
+ * SPEC.md section 8.2's initial state, and 8.1's "the first history point is
+ * recorded at entry." `entryPnlPct` should be computed from a real exit-lane
+ * quote fetched immediately after the entry fill (a just-opened position is
+ * typically already below zero — round-trip fees, price impact, simulated
+ * slippage — never assume it's exactly 0%). Pass null when that quote
+ * failed: history then starts empty and peakPnl starts at -Infinity (never
+ * a fabricated reading), so the first *real* regular poll's pnl — whatever
+ * its sign — always becomes the peak via step 4's Math.max, instead of
+ * being silently floored at a guessed starting value.
+ */
+export function initialExitState(opts: {
+  entryTime: number;
+  entryLiquidity: number;
+  targetProfitPct: number;
+  holdMinutes: number;
+  entryPnlPct: number | null;
+}): ExitState {
+  // peakPnl is always derived from the same value recorded as history[0] (when there is
+  // one) — never a second, independently hardcoded literal that could drift out of sync
+  // with it. A trade that stops out on its very first confirmed reading, before step 4
+  // ever runs, keeps this exact initial value as its peak, since it's a real observation
+  // (or, in the no-quote fallback, the neutral default), not an arbitrary starting number.
+  const history: HistoryPoint[] = opts.entryPnlPct !== null ? [{ t: opts.entryTime, pnl: opts.entryPnlPct }] : [];
   return {
     entryTime: opts.entryTime,
     entryLiquidity: opts.entryLiquidity,
-    peakPnl: 0,
+    peakPnl: opts.entryPnlPct ?? Number.NEGATIVE_INFINITY,
     currentTarget: opts.targetProfitPct,
     targetExtensions: 0,
     timerRestarts: 0,
@@ -209,6 +231,20 @@ export function initialExitState(opts: { entryTime: number; entryLiquidity: numb
     fastStreak: 0,
     lowLiqStreak: 0,
     noRouteSince: null,
-    history: [{ t: opts.entryTime, pnl: 0 }],
+    history,
   };
+}
+
+/**
+ * A closed trade's peak can never be reported as worse than its own final
+ * realized pnl — true by definition (peak = the highest pnl ever observed,
+ * and the closing reading is one such observation). This guards the rare
+ * compound case where the quote-failure fallback above leaves peakPnl at
+ * -Infinity and the position then closes on a confirmed stop-loss before
+ * step 4 ever runs (section 8.3 order: stop-loss is step 3, record is step
+ * 4) — without this, -Infinity would otherwise be the value persisted and
+ * reported as that trade's peak.
+ */
+export function finalPeakPnl(peakPnl: number, finalPnlPct: number): number {
+  return Math.max(peakPnl, finalPnlPct);
 }

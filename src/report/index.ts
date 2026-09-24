@@ -305,3 +305,75 @@ export function goLiveChecklist(paperTrades: readonly TradeRecord[], hasStuckPos
     { check: "no positions currently stuck", pass: !hasStuckPositions, detail: hasStuckPositions ? "stuck positions present" : "none" },
   ];
 }
+
+export interface TradeDetailHistoryPoint {
+  t: number;
+  pnl: number;
+}
+
+/**
+ * Everything section 11.1 says a closed trade stores, laid out per-trade
+ * rather than aggregated — the `--trades` report mode. `history` is the
+ * trade's full trade_history (preserved past the close; see storage/
+ * tradeHistory.ts), already ordered oldest-first.
+ */
+export interface TradeDetailRecord {
+  id: number;
+  mint: string;
+  symbol: string | null;
+  entryTime: number;
+  exitTime: number;
+  sizeUsd: number;
+  costBasis: number;
+  tokenAmount: number | null;
+  tokenDecimals: number | null;
+  proceeds: number;
+  netPnlUsd: number;
+  netPnlPct: number;
+  peakPnl: number;
+  exitReason: string;
+  entryLiquidityUsd: number | null;
+  entryValuationPnlPct: number | null;
+  entryQuoteInAmount: string | null;
+  entryQuoteOutAmount: string | null;
+  exitQuoteInAmount: string | null;
+  exitQuoteOutAmount: string | null;
+  history: readonly TradeDetailHistoryPoint[];
+}
+
+function fmtUsd4(v: number): string {
+  return `${v >= 0 ? "" : "-"}$${Math.abs(v).toFixed(4)}`;
+}
+function fmtPctOrNa(v: number | null): string {
+  if (v === null || !Number.isFinite(v)) return "n/a";
+  return `${v.toFixed(2)}%`;
+}
+function fmtQuote(inAmount: string | null, outAmount: string | null): string {
+  if (inAmount === null && outAmount === null) return "n/a (no successful quote)";
+  return `in=${inAmount ?? "n/a"} out=${outAmount ?? "n/a"}`;
+}
+
+/** `npm run report -- --trades` / the `--trades` mode: full per-trade detail, not aggregate stats. */
+export function formatTradeDetail(trades: readonly TradeDetailRecord[], opts: { historyPoints?: number } = {}): string {
+  const historyPoints = opts.historyPoints ?? 5;
+  if (trades.length === 0) return "No trades.";
+
+  const lines: string[] = [];
+  for (const t of trades) {
+    const holdSec = (t.exitTime - t.entryTime) / 1000;
+    lines.push(`=== Trade ${t.id}: ${t.symbol ?? t.mint.slice(0, 6)} (${t.mint}) ===`);
+    lines.push(`  entry: ${new Date(t.entryTime).toISOString()}  exit: ${new Date(t.exitTime).toISOString()}  hold: ${holdSec.toFixed(1)}s`);
+    lines.push(`  size: $${t.sizeUsd.toFixed(2)}  cost basis: $${t.costBasis.toFixed(4)}  proceeds: $${t.proceeds.toFixed(4)}`);
+    lines.push(`  net PnL: ${fmtUsd4(t.netPnlUsd)} / ${t.netPnlPct.toFixed(2)}%  peak: ${fmtPctOrNa(t.peakPnl)}  exit reason: ${t.exitReason}`);
+    lines.push(`  entry liquidity: ${t.entryLiquidityUsd !== null ? `$${t.entryLiquidityUsd.toFixed(2)}` : "n/a"}`);
+    lines.push(`  tokens received: ${t.tokenAmount ?? "n/a"}  decimals: ${t.tokenDecimals ?? "n/a"}`);
+    lines.push(`  entry valuation (first exit-lane quote after fill): ${fmtPctOrNa(t.entryValuationPnlPct)}`);
+    lines.push(`  entry quote (raw): ${fmtQuote(t.entryQuoteInAmount, t.entryQuoteOutAmount)}`);
+    lines.push(`  exit quote (raw): ${fmtQuote(t.exitQuoteInAmount, t.exitQuoteOutAmount)}`);
+    const shown = t.history.slice(0, historyPoints).map((p) => `(${p.t}, ${p.pnl.toFixed(2)}%)`);
+    const more = t.history.length > historyPoints ? `, +${t.history.length - historyPoints} more` : "";
+    lines.push(`  history (first ${historyPoints} of ${t.history.length}): ${shown.length > 0 ? shown.join(", ") + more : "none"}`);
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd();
+}
