@@ -1,0 +1,9 @@
+.env
+*.db
+*.db-*
+*.sqlite*
+KILL
+node_modules/
+dist/
+logs/
+*.log
