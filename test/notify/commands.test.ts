@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { TelegramUpdate } from "../../src/clients/telegram.js";
-import { PAUSED_KEY, pollAndHandleCommands, type CommandsTelegram } from "../../src/notify/commands.js";
+import {
+  CONSECUTIVE_ERRORS_KEY,
+  KILLED_VIA_COMMAND_KEY,
+  PAUSED_KEY,
+  pollAndHandleCommands,
+  type CommandsTelegram,
+} from "../../src/notify/commands.js";
 import { createMemoryLogger } from "../../src/logger/index.js";
 import { openDb } from "../../src/storage/db.js";
 import { StateStore } from "../../src/storage/state.js";
@@ -29,6 +35,7 @@ describe("pollAndHandleCommands", () => {
       offset: 0,
       timeoutSec: 1,
       buildDigest: () => "DIGEST TEXT",
+      buildReport: () => "REPORT TEXT",
       logger: createMemoryLogger(),
     });
     expect(telegram.sent).toEqual(["DIGEST TEXT"]);
@@ -46,6 +53,7 @@ describe("pollAndHandleCommands", () => {
       offset: 0,
       timeoutSec: 1,
       buildDigest: () => "",
+      buildReport: () => "REPORT TEXT",
       logger: createMemoryLogger(),
     });
     expect(store.get(PAUSED_KEY, false)).toBe(true);
@@ -64,10 +72,97 @@ describe("pollAndHandleCommands", () => {
       offset: 0,
       timeoutSec: 1,
       buildDigest: () => "",
+      buildReport: () => "REPORT TEXT",
       logger: createMemoryLogger(),
     });
     expect(store.get(PAUSED_KEY, true)).toBe(false);
-    expect(telegram.sent).toEqual(["Entries resumed."]);
+    expect(telegram.sent).toEqual(["Entries resumed. (If a KILL file is present, delete it too.)"]);
+  });
+
+  it("/resume also clears error halts and the kill switch (but not the daily-loss halt, which has no command)", async () => {
+    const telegram = fakeTelegram([
+      { update_id: 1, message: { message_id: 1, chat: { id: "chat1" }, text: "/resume", date: 0 } },
+    ]);
+    const store = new StateStore(openDb(":memory:"));
+    store.set(CONSECUTIVE_ERRORS_KEY, 5);
+    store.set(KILLED_VIA_COMMAND_KEY, true);
+    await pollAndHandleCommands({
+      telegram,
+      stateStore: store,
+      offset: 0,
+      timeoutSec: 1,
+      buildDigest: () => "",
+      buildReport: () => "",
+      logger: createMemoryLogger(),
+    });
+    expect(store.get(CONSECUTIVE_ERRORS_KEY, -1)).toBe(0);
+    expect(store.get(KILLED_VIA_COMMAND_KEY, true)).toBe(false);
+  });
+
+  it("responds to /report with the report", async () => {
+    const telegram = fakeTelegram([
+      { update_id: 1, message: { message_id: 1, chat: { id: "chat1" }, text: "/report", date: 0 } },
+    ]);
+    const store = new StateStore(openDb(":memory:"));
+    await pollAndHandleCommands({
+      telegram,
+      stateStore: store,
+      offset: 0,
+      timeoutSec: 1,
+      buildDigest: () => "",
+      buildReport: () => "REPORT TEXT",
+      logger: createMemoryLogger(),
+    });
+    expect(telegram.sent).toEqual(["REPORT TEXT"]);
+  });
+
+  it("records pause/resume/killswitch to the audit trail via recordEvent", async () => {
+    const recordEvent = vi.fn();
+    const store = new StateStore(openDb(":memory:"));
+    const baseCtx = {
+      stateStore: store,
+      offset: 0,
+      timeoutSec: 1,
+      buildDigest: () => "",
+      buildReport: () => "",
+      logger: createMemoryLogger(),
+      recordEvent,
+    };
+
+    await pollAndHandleCommands({
+      telegram: fakeTelegram([{ update_id: 1, message: { message_id: 1, chat: { id: "chat1" }, text: "/pause", date: 0 } }]),
+      ...baseCtx,
+    });
+    await pollAndHandleCommands({
+      telegram: fakeTelegram([{ update_id: 2, message: { message_id: 2, chat: { id: "chat1" }, text: "/resume", date: 0 } }]),
+      ...baseCtx,
+    });
+    await pollAndHandleCommands({
+      telegram: fakeTelegram([{ update_id: 3, message: { message_id: 3, chat: { id: "chat1" }, text: "/killswitch", date: 0 } }]),
+      ...baseCtx,
+    });
+
+    expect(recordEvent).toHaveBeenCalledWith("pause", expect.any(String));
+    expect(recordEvent).toHaveBeenCalledWith("resume", expect.any(String));
+    expect(recordEvent).toHaveBeenCalledWith("killswitch", expect.any(String));
+  });
+
+  it("/killswitch sets the kill flag and acknowledges", async () => {
+    const telegram = fakeTelegram([
+      { update_id: 1, message: { message_id: 1, chat: { id: "chat1" }, text: "/killswitch", date: 0 } },
+    ]);
+    const store = new StateStore(openDb(":memory:"));
+    await pollAndHandleCommands({
+      telegram,
+      stateStore: store,
+      offset: 0,
+      timeoutSec: 1,
+      buildDigest: () => "",
+      buildReport: () => "",
+      logger: createMemoryLogger(),
+    });
+    expect(store.get(KILLED_VIA_COMMAND_KEY, false)).toBe(true);
+    expect(telegram.sent[0]).toContain("Kill switch activated");
   });
 
   it("ignores commands from a chat other than the configured one", async () => {
@@ -81,6 +176,7 @@ describe("pollAndHandleCommands", () => {
       offset: 0,
       timeoutSec: 1,
       buildDigest: () => "",
+      buildReport: () => "REPORT TEXT",
       logger: createMemoryLogger(),
     });
     expect(store.get(PAUSED_KEY, false)).toBe(false);
@@ -98,6 +194,7 @@ describe("pollAndHandleCommands", () => {
       offset: 0,
       timeoutSec: 1,
       buildDigest: () => "",
+      buildReport: () => "REPORT TEXT",
       logger: createMemoryLogger(),
     });
     expect(telegram.sent).toEqual([]);
@@ -114,6 +211,7 @@ describe("pollAndHandleCommands", () => {
       offset: 0,
       timeoutSec: 1,
       buildDigest: () => "",
+      buildReport: () => "REPORT TEXT",
       logger: createMemoryLogger(),
     });
     expect(result.nextOffset).toBe(6);

@@ -27,6 +27,14 @@ export function selectPair(pairs: readonly DexPair[], mint: string, allowedQuote
   return best;
 }
 
+/** Every valid pair for `mint` under the pair selection rule, not just the highest-liquidity one — used by the holders check (section 5, check 8) to exclude pool-vault balances across all of a mint's pairs. */
+export function selectAllValidPairs(pairs: readonly DexPair[], mint: string, allowedQuoteMints: readonly string[]): DexPair[] {
+  const allowed = new Set(allowedQuoteMints);
+  return pairs.filter(
+    (pair) => pair.chainId === SOLANA_CHAIN_ID && pair.baseToken?.address === mint && allowed.has(pair.quoteToken?.address ?? ""),
+  );
+}
+
 export interface DexScreenerClientOptions {
   baseUrl?: string;
   timeoutMs?: number;

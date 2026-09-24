@@ -1,0 +1,224 @@
+import { describe, expect, it } from "vitest";
+import {
+  breakdownByExitReason,
+  breakdownByTradingDay,
+  compareShadowVsActual,
+  compareShadowsSelectedVsUnselected,
+  computeTotals,
+  exitedTooEarly,
+  formatReport,
+  goLiveChecklist,
+  quantileBuckets,
+  scoreComponentCorrelations,
+  skipReasonStats,
+  type ShadowRecord,
+  type TradeRecord,
+} from "../../src/report/index.js";
+
+function trade(overrides: Partial<TradeRecord> = {}): TradeRecord {
+  return {
+    mode: "paper",
+    exitTime: 0,
+    tradingDay: "2026-01-01",
+    exitReason: "target",
+    netPnlUsd: 0,
+    netPnlPct: 0,
+    m5ChangePct: null,
+    h1ChangePct: null,
+    buyPressurePct: null,
+    liquidityUsd: null,
+    pairAgeMs: null,
+    top10Pct: null,
+    score: null,
+    scoreComponents: null,
+    ...overrides,
+  };
+}
+
+// Hand-checked dataset (see the comment on each expectation for the arithmetic).
+const T1 = trade({ exitTime: 1000, tradingDay: "2026-01-01", exitReason: "target", netPnlUsd: 10, netPnlPct: 20 });
+const T2 = trade({ exitTime: 2000, tradingDay: "2026-01-01", exitReason: "stop", netPnlUsd: -5, netPnlPct: -10 });
+const T3 = trade({ exitTime: 3000, tradingDay: "2026-01-02", exitReason: "target", netPnlUsd: 15, netPnlPct: 25 });
+const T4 = trade({ exitTime: 4000, tradingDay: "2026-01-02", exitReason: "time_exit", netPnlUsd: -20, netPnlPct: -30 });
+const DATASET = [T1, T2, T3, T4];
+
+describe("computeTotals (hand-checked)", () => {
+  const totals = computeTotals(DATASET);
+
+  it("win rate: 2 of 4 trades have net PnL USD > 0", () => {
+    expect(totals.winRate).toBeCloseTo(0.5, 10);
+  });
+
+  it("median/mean net PnL %, sorted [-30,-10,20,25]", () => {
+    expect(totals.medianNetPnlPct).toBeCloseTo(5, 10); // (-10+20)/2
+    expect(totals.meanNetPnlPct).toBeCloseTo(1.25, 10); // (20-10+25-30)/4
+  });
+
+  it("median/mean net PnL USD, sorted [-20,-5,10,15]", () => {
+    expect(totals.medianNetPnlUsd).toBeCloseTo(2.5, 10); // (-5+10)/2
+    expect(totals.meanNetPnlUsd).toBeCloseTo(0, 10);
+  });
+
+  it("p10/p90 net PnL % via linear interpolation", () => {
+    expect(totals.p10NetPnlPct).toBeCloseTo(-24, 10); // rank=0.3 -> -30*0.7 + -10*0.3
+    expect(totals.p90NetPnlPct).toBeCloseTo(23.5, 10); // rank=2.7 -> 20*0.3 + 25*0.7
+  });
+
+  it("average win vs average loss", () => {
+    expect(totals.avgWinUsd).toBeCloseTo(12.5, 10); // mean(10,15)
+    expect(totals.avgLossUsd).toBeCloseTo(-12.5, 10); // mean(-5,-20)
+  });
+
+  it("total net PnL and max drawdown of the cumulative curve", () => {
+    expect(totals.totalNetPnlUsd).toBeCloseTo(0, 10);
+    // Chronological order [10,-5,15,-20] -> cumulative [10,5,20,0], peak [10,10,20,20], drawdown max = 20.
+    expect(totals.maxDrawdownUsd).toBeCloseTo(20, 10);
+  });
+});
+
+describe("breakdownByExitReason / breakdownByTradingDay", () => {
+  it("groups correctly and each group's totals are internally consistent", () => {
+    const byReason = breakdownByExitReason(DATASET);
+    expect(byReason.target!.trades).toBe(2);
+    expect(byReason.target!.totalNetPnlUsd).toBeCloseTo(25, 10); // 10+15
+    expect(byReason.stop!.trades).toBe(1);
+
+    const byDay = breakdownByTradingDay(DATASET);
+    expect(byDay["2026-01-01"]!.totalNetPnlUsd).toBeCloseTo(5, 10); // 10-5
+    expect(byDay["2026-01-02"]!.totalNetPnlUsd).toBeCloseTo(-5, 10); // 15-20
+  });
+});
+
+describe("quantileBuckets", () => {
+  it("splits into equal-size buckets ordered by the key, earliest/lowest first", () => {
+    const withScores = [
+      trade({ netPnlUsd: 1, score: 0.9 }),
+      trade({ netPnlUsd: 2, score: 0.1 }),
+      trade({ netPnlUsd: 3, score: 0.5 }),
+      trade({ netPnlUsd: 4, score: 0.3 }),
+    ];
+    const buckets = quantileBuckets(withScores, (t) => t.score, 2);
+    expect(buckets).toHaveLength(2);
+    expect(buckets[0]!.count).toBe(2);
+    expect(buckets[0]!.totals.trades).toBe(2); // scores 0.1, 0.3 -> the two trades with netPnlUsd 2 and 4
+    expect(buckets[1]!.totals.trades).toBe(2); // scores 0.5, 0.9 -> netPnlUsd 3 and 1
+  });
+
+  it("excludes trades with a null key", () => {
+    const buckets = quantileBuckets([trade({ score: null }), trade({ score: 0.5 })], (t) => t.score, 2);
+    const total = buckets.reduce((sum, b) => sum + b.count, 0);
+    expect(total).toBe(1);
+  });
+});
+
+describe("scoreComponentCorrelations", () => {
+  const components = { buyPressure: 0, activity: 0, momentum: 0, depth: 0, holders: 0.5, freshness: 0 };
+  const withComponents = [
+    trade({ netPnlUsd: -10, scoreComponents: { ...components, buyPressure: 0.2 } }),
+    trade({ netPnlUsd: 0, scoreComponents: { ...components, buyPressure: 0.5 } }),
+    trade({ netPnlUsd: 10, scoreComponents: { ...components, buyPressure: 0.8 } }),
+  ];
+
+  it("a perfectly linear relationship correlates near 1", () => {
+    expect(scoreComponentCorrelations(withComponents).buyPressure).toBeCloseTo(1, 6);
+  });
+
+  it("a constant component (zero variance) correlates at 0, not NaN", () => {
+    expect(scoreComponentCorrelations(withComponents).holders).toBe(0);
+  });
+});
+
+describe("shadow comparisons", () => {
+  const shadows: ShadowRecord[] = [
+    { outcome: "selected", netPnlUsd: 10, netPnlPct: 20 },
+    { outcome: "selected", netPnlUsd: -5, netPnlPct: -10 },
+    { outcome: "closed", netPnlUsd: 20, netPnlPct: 40 },
+    { outcome: "closed", netPnlUsd: -2, netPnlPct: -5 },
+    { outcome: "unsellable", netPnlUsd: null, netPnlPct: null },
+    { outcome: "open", netPnlUsd: null, netPnlPct: null },
+  ];
+
+  it("compares selected vs unselected, excluding unsellable and still-open shadows", () => {
+    const result = compareShadowsSelectedVsUnselected(shadows);
+    expect(result.selected.trades).toBe(2);
+    expect(result.selected.totalNetPnlUsd).toBeCloseTo(5, 10);
+    expect(result.unselected.trades).toBe(2);
+    expect(result.unselected.totalNetPnlUsd).toBeCloseTo(18, 10);
+  });
+
+  it("compares shadow vs actual pnl for selected mints (hand-checked: two points give a perfect correlation)", () => {
+    const result = compareShadowVsActual([
+      { shadowNetPnlPct: 20, actualNetPnlPct: 22 },
+      { shadowNetPnlPct: -5, actualNetPnlPct: -4 },
+    ]);
+    expect(result.pairs).toBe(2);
+    expect(result.meanAbsDiffPct).toBeCloseTo(1.5, 10); // mean(|20-22|, |-5+4|) = mean(2,1)
+    expect(result.correlation).toBeCloseTo(1, 6);
+  });
+});
+
+describe("exitedTooEarly", () => {
+  it("hand-checked: one of two priced rows shows upside after the exit", () => {
+    const result = exitedTooEarly([
+      { exitPriceUsd: 1, price15mUsd: 1.2, price60mUsd: null }, // +20%
+      { exitPriceUsd: 1, price15mUsd: 0.9, price60mUsd: 0.8 }, // best 0.9 -> -10%, not "too early"
+      { exitPriceUsd: 2, price15mUsd: null, price60mUsd: null }, // no data, excluded
+    ]);
+    expect(result.shareTooEarly).toBeCloseTo(0.5, 10);
+    expect(result.medianUpsidePctMissed).toBeCloseTo(20, 10);
+  });
+});
+
+describe("skipReasonStats", () => {
+  it("hand-checked median +15/+60 percent change by reason", () => {
+    const stats = skipReasonStats([
+      { skipReason: "liquidity", priceAtSkipUsd: 1, price15mUsd: 1.1, price60mUsd: 1.3 }, // +10%, +30%
+      { skipReason: "liquidity", priceAtSkipUsd: 2, price15mUsd: 1.8, price60mUsd: 2.4 }, // -10%, +20%
+      { skipReason: "pair", priceAtSkipUsd: 1, price15mUsd: null, price60mUsd: null },
+    ]);
+    const liquidity = stats.find((s) => s.reason === "liquidity")!;
+    expect(liquidity.count).toBe(2);
+    expect(liquidity.median15mPctChange).toBeCloseTo(0, 10); // median(10,-10)
+    expect(liquidity.median60mPctChange).toBeCloseTo(25, 10); // median(30,20)
+
+    const pair = stats.find((s) => s.reason === "pair")!;
+    expect(pair.count).toBe(1);
+    expect(pair.median15mPctChange).toBe(0); // no priced data -> empty median, not NaN
+  });
+});
+
+describe("goLiveChecklist", () => {
+  it("PASS/FAIL each rule against a small dataset with low thresholds", () => {
+    const cfg = { minTrades: 4, minDays: 0, minMedianPnlPct: 0, minTotalPnlUsd: -1, minP10PnlPct: -50 };
+    const items = goLiveChecklist(DATASET, false, cfg);
+
+    expect(items.find((i) => i.check.startsWith("closed trades"))!.pass).toBe(true); // 4 >= 4
+    expect(items.find((i) => i.check.startsWith("median net PnL"))!.pass).toBe(true); // 5 > 0
+    expect(items.find((i) => i.check.startsWith("total net PnL"))!.pass).toBe(true); // 0 > -1
+    expect(items.find((i) => i.check.startsWith("p10 net PnL"))!.pass).toBe(true); // -24 >= -50
+    expect(items.find((i) => i.check === "no positions currently stuck")!.pass).toBe(true);
+  });
+
+  it("fails the trade-count and stuck-position checks when they don't clear", () => {
+    const cfg = { minTrades: 100, minDays: 7, minMedianPnlPct: 0, minTotalPnlUsd: 0, minP10PnlPct: -20 };
+    const items = goLiveChecklist(DATASET, true, cfg);
+    expect(items.find((i) => i.check.startsWith("closed trades"))!.pass).toBe(false);
+    expect(items.find((i) => i.check === "no positions currently stuck")!.pass).toBe(false);
+  });
+});
+
+describe("formatReport", () => {
+  it("renders every section, including PASS/FAIL lines for the go-live checklist", () => {
+    const text = formatReport({
+      trades: DATASET,
+      paperTrades: DATASET,
+      skipTracks: [{ skipReason: "liquidity", priceAtSkipUsd: 1, price15mUsd: 1.1, price60mUsd: 1.2 }],
+      hasStuckPositions: false,
+      goLiveConfig: { minTrades: 4, minDays: 0, minMedianPnlPct: 0, minTotalPnlUsd: -1, minP10PnlPct: -50 },
+    });
+    expect(text).toContain("=== Report (4 trades) ===");
+    expect(text).toContain("By exit reason:");
+    expect(text).toContain("Go-live checklist:");
+    expect(text).toContain("[PASS]");
+  });
+});

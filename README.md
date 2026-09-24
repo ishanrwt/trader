@@ -1,42 +1,41 @@
-# Solana Trader Bot — Phase 1: Foundation and Discovery
+# Solana Trader Bot — Phase 2: Paper Trading
 
-Standalone TypeScript/Node service that discovers new Solana tokens from DexScreener and
-tracks them through a pending queue. **Phase 1 makes no trading decisions**: it does not
-score, select, buy, sell, or send any transaction. See `SPEC.md` for the full build spec
-and `SPEC.md` section 15 for what each phase covers.
+Standalone TypeScript/Node service that discovers new Solana tokens from DexScreener,
+scores and selects candidates, opens and manages **virtual (paper) positions**, and
+tracks everything for analysis. See `SPEC.md` for the full build spec.
 
-Full trading behavior (scoring, paper/live positions, exits) is Phase 2 and Phase 3 and
-has not been built yet.
+**No code in this project signs or sends a transaction.** `MODE=live` is refused at
+startup (Phase 3 hasn't been built), and there's a standing test
+(`test/safety/noSendPath.test.ts`) that scans `src/` for the vocabulary of
+signing/sending a transaction and fails the build if any of it ever shows up before
+Phase 3 is deliberately built.
 
-## What Phase 1 does
+## What Phase 2 adds on top of Phase 1
 
-- Polls DexScreener's latest token profiles every `DISCOVERY_SECONDS` and queues new
-  Solana mints.
-- Rechecks every pending mint every `PENDING_RECHECK_SECONDS` against entry gate checks
-  1-4 (duplicate, pair, liquidity, entry window). Checks 5-8 (momentum, buy pressure,
-  mint safety, holders) need positions/trade history/RPC wiring that Phase 2 adds, so a
-  mint that clears checks 1-4 simply stays "pending" and ages out normally — it never
-  reaches "READY" in this phase.
-- Tracks SOL/USD price from DexScreener every 5 minutes.
-- Sends a Telegram digest every `DIGEST_INTERVAL_MINUTES` (funnel + health only; the
-  READY/entered/score fields explicitly say "not yet implemented (Phase 2)").
-- Sends an urgent Telegram message on startup/restart (with the downtime gap on a
-  restart) and on a DexScreener outage lasting more than `OUTAGE_ALERT_MINUTES`.
-- Responds to `/status`, `/pause`, `/resume` from the configured Telegram chat only.
-- All external calls (DexScreener, Solana RPC, Jupiter, Telegram) go through a timeout,
-  error handling, and a rate limiter. The Solana RPC and Jupiter clients are built and
-  startup-validated in this phase but aren't called yet by any business logic — checks
-  5-8, sellability quotes, and position monitoring are Phase 2.
-- Every log line has secrets scrubbed out (API keys, the full Solana RPC URL, the full
-  Telegram bot token) — even if they appear embedded inside a longer string like a URL
-  or an error message.
+- Entry gate checks 5-8 (momentum, buy pressure, mint safety via RPC, holder
+  concentration via RPC) — a mint that clears all 8 becomes **READY**.
+- Scoring (`src/selection/score.ts`) and slot filling (`src/selection/index.ts`):
+  ranks READY mints, checks sellability and entry drift through Jupiter's entry lane,
+  and opens paper positions.
+- The virtual wallet, paper entry/exit fills (latency + slippage + fee, per section 7).
+- The exit state machine (`src/monitor/stateMachine.ts`, pure and fully unit-tested)
+  and the position monitor that polls it every `POLL_SECONDS` through Jupiter's exit
+  lane, concurrently across positions so one position's fill latency never delays
+  polling the others.
+- Risk blockers (kill switch, daily loss, loss streak, error halt, slots) and controls
+  (`KILL` file or `/killswitch`, `/pause`, `/resume`). The kill switch runs on its own
+  timer, independent of whether an entry is being attempted, so it still closes
+  everything even with every slot full.
+- Shadow positions, skip tracking, and post-exit tracking — all DexScreener-only, never
+  Jupiter.
+- The full digest (trades closed, open positions, trading-day stats, risk, the
+  complete funnel), `npm run report` / `/report` with the go-live checklist.
 
 ## Requirements
 
 - Node 24 LTS (Node 22 also works — checked as part of `engines` in `package.json`).
 - No native build tools required on Windows or Linux. `better-sqlite3` ships prebuilt
-  N-API binaries; `tsx`/`vitest` ship prebuilt `esbuild` binaries. Verified in this repo
-  by installing and running on Windows without Visual Studio Build Tools.
+  N-API binaries; `tsx`/`vitest` ship prebuilt `esbuild` binaries.
 
 ## Setup
 
@@ -47,18 +46,15 @@ cp .env.example .env
 
 Then fill in `.env` yourself (this project never creates `.env` or asks for your keys):
 
-- `SOLANA_RPC_URL` — a keyed RPC provider URL (e.g. Helius's free plan). Read-only calls
-  only in this phase.
-- `JUPITER_API_KEY` — Jupiter's free API key (1 request/second). Not called yet in Phase
-  1, but validated and rate-limited at startup.
-- `TRADER_TELEGRAM_BOT_TOKEN` / `TRADER_TELEGRAM_CHAT_ID` — a dedicated bot and chat for
-  this project (create a bot via @BotFather; get your chat id by messaging the bot and
-  checking `https://api.telegram.org/bot<token>/getUpdates`).
+- `SOLANA_RPC_URL` — a keyed RPC provider URL (e.g. Helius's free plan).
+- `JUPITER_API_KEY` — Jupiter's free API key (1 request/second).
+- `TRADER_TELEGRAM_BOT_TOKEN` / `TRADER_TELEGRAM_CHAT_ID` — a dedicated bot and chat
+  for this project.
 - Leave `WALLET_PRIVATE_KEY` and `LIVE_ACK` empty — `MODE=live` isn't supported until
   Phase 3 and startup refuses to run with a non-empty wallet key in paper mode.
 
-Every other value in `.env.example` already matches `SPEC.md`'s defaults; tune only what
-you need to.
+Every other value in `.env.example` already matches `SPEC.md`'s defaults; tune only
+what you need to.
 
 ## Run
 
@@ -66,23 +62,26 @@ you need to.
 npm start
 ```
 
-This runs `src/index.ts` directly via `tsx` (no separate build step). On startup it:
+Runs `src/index.ts` directly via `tsx` (no build step). `Ctrl+C` (SIGINT) or SIGTERM
+shuts it down cleanly. Logs go to the console (JSON) and to `logs/trader-*.log` (daily
+rotation), both with secrets redacted.
 
-1. Loads and validates `.env` (refuses to start on any invalid value, and warns about
-   unknown keys in `.env` that this app doesn't recognize).
-2. Opens/migrates `trader.db` (SQLite, gitignored).
-3. Sends a Telegram "started" (or "restarted", with the downtime gap) message if
-   `URGENT_ALERTS=true`.
-4. Starts the discovery loops, SOL price refresh, the digest loop, and the Telegram
-   command poller. `Ctrl+C` (SIGINT) or SIGTERM shuts it down cleanly.
+**Phase 2 "done" per `SPEC.md`**: `npm test` passes (below), and a short paper run
+against real APIs opens and closes at least one virtual position, sends a digest, and
+`npm run report` produces output. That real-API run is on you to do with your own
+keys.
 
-Logs go to the console (JSON) and to `logs/trader-*.log` (daily rotation), both with
-secrets redacted.
+## Report
 
-**Phase 1 "done" per `SPEC.md`**: tests pass (below), and a one-hour run against real
-APIs with `DIGEST_INTERVAL_MINUTES=10` produces digests with plausible funnel counts and
-no crash. That real-API run is on you to do with your own keys — this project doesn't
-run it for you.
+```sh
+npm run report                                  # everything
+npm run report -- --mode paper --from 2026-01-01 --to 2026-01-31
+```
+
+Same output as the `/report` Telegram command: totals, breakdowns by exit reason and
+trading day, score-quintile and entry-feature results, score-component correlations,
+shadow comparisons, "exited too early," skip-reason stats, and the go-live checklist
+(paper trades only).
 
 ## Test
 
@@ -91,13 +90,62 @@ npm test        # vitest run — all tests use mocked network, no real API calls
 npm run typecheck
 ```
 
-Tests cover: config validation (weights sum, the Jupiter budget math including
-`AUTO_STRETCH_POLL`, the hard position cap, unknown-key detection), secret redaction (in
-both a standalone scrubber and through the logger, including a failed Telegram request
-and a failed RPC request logging no secrets), the sliding-window and Jupiter two-lane
-rate limiters, SQLite migrations, the DexScreener pair-selection rule (including the
-SOL/USD-specific case), entry gate checks 1-4, the discovery/pending-queue orchestration,
-and the digest/commands/outage/startup-message builders.
+Tests cover every pure module by hand (the exit state machine's full section-8.3
+bullet list including the stop-loss confirm/liquidity-double-count fix, the entry
+gate's 8 checks, scoring, the Jupiter two-lane budget, risk blockers including the
+kill switch's independence from entry attempts, paper fills, shadow cost math, and
+report math including the go-live checklist on hand-checked datasets), plus SQLite
+migrations/storage, secret redaction, and the digest/commands/report-formatting
+builders.
+
+## pm2 process management
+
+[pm2](https://pm2.keymetrics.io/) keeps the bot running and restarts it on crash.
+
+```sh
+npm install -g pm2
+pm2 start "npx tsx src/index.ts" --name trader
+pm2 logs trader
+pm2 stop trader
+```
+
+### Linux: start on boot
+
+```sh
+pm2 startup            # prints a systemd command to run once, with sudo
+pm2 save                # persists the current process list
+```
+
+After a reboot, systemd restarts pm2, which restarts `trader`.
+
+### Windows: pm2's own startup command doesn't work
+
+`pm2 startup`/`pm2-installer` targets Linux init systems (systemd, upstart) and
+doesn't support Windows. Two working alternatives:
+
+**Option A — Task Scheduler (no extra dependency):**
+
+1. `pm2 save` after starting the process once, so pm2 remembers it (`pm2 resurrect`
+   will bring it back).
+2. Open Task Scheduler → Create Task:
+   - Trigger: "At log on" (or "At startup" for a service account).
+   - Action: run `pm2` (find its path with `where pm2` — usually inside your global
+     npm prefix, e.g. `C:\Users\<you>\AppData\Roaming\npm\pm2.cmd`) with argument
+     `resurrect`.
+   - Under Settings, enable "Run whether user is logged on or not" if you want it to
+     survive a logoff.
+
+**Option B — [pm2-windows-startup](https://www.npmjs.com/package/pm2-windows-startup)**
+(a small community package that registers pm2 as a Windows startup item):
+
+```powershell
+npm install -g pm2-windows-startup
+pm2-startup install
+pm2 save
+```
+
+Either way, verify it survives a real reboot before relying on it — `pm2 status`
+after logging back in should still show `trader` as `online`.
 
 ## Project layout
 
@@ -105,26 +153,33 @@ and the digest/commands/outage/startup-message builders.
 src/
   config/      env schema (zod), cross-field validation, HARD_MAX_POSITION_USD
   logger/      pino + daily-rotating file, secret redaction
-  storage/     SQLite (better-sqlite3), versioned migrations, state + events tables
+  storage/     SQLite (better-sqlite3), versioned migrations, one store class per table
   limiters/    sliding-window limiter, the Jupiter exit/entry lane budget
   clients/     DexScreener, Jupiter (quotes only), Solana RPC (read-only), Telegram
-  discovery/   profile polling, the pending queue
-  gate/        entry gate checks 1-4 (pure function)
+  discovery/   profile polling, the pending queue, checks 1-8 orchestration
+  gate/        entry gate checks 1-8 (pure functions)
+  selection/   score (pure) and slot filling
+  wallet/      virtual wallet (paper mode)
+  executor/    paper entry/exit fills
+  monitor/     the exit state machine (pure) and the position poll loop
+  risk/        entry blockers, kill switch, loss-streak/daily-loss accounting (pure)
+  tracking/    shadow positions, skip tracking, post-exit tracking
+  report/      report math (pure) + go-live checklist + CLI
   solPrice/    SOL/USD tracker
-  notify/      digest, urgent messages, outage tracking, /status /pause /resume
+  notify/      digest, urgent messages, outage tracking, Telegram commands
   index.ts     composition root (npm start)
 test/          mirrors src/, one file per module
 ```
 
 ## Notes on library choices
 
-- **No Solana SDK yet.** Phase 1-2 only ever make four read-only JSON-RPC calls, so the
-  RPC client is a thin `fetch` wrapper rather than `@solana/web3.js` or `@solana/kit`.
-  `@solana/kit` (the modern, actively-recommended SDK) is planned for Phase 3 when
-  transaction building/signing is needed.
-- **`better-sqlite3` over `node:sqlite`**: `node:sqlite` is still a release candidate as
-  of Node 24; `better-sqlite3` v13 is N-API-based (portable prebuilt binaries across Node
-  versions) and more mature for versioned migrations.
+- **No Solana SDK yet.** Phases 1-2 only ever make four read-only JSON-RPC calls and
+  Jupiter quotes (no swap execution), so the RPC and Jupiter clients are thin `fetch`
+  wrappers rather than `@solana/web3.js` or `@solana/kit`. `@solana/kit` (the modern,
+  actively-recommended SDK) is planned for Phase 3 when transaction building/signing
+  is needed.
+- **`better-sqlite3` over `node:sqlite`**: `node:sqlite` is still a release candidate
+  as of Node 24; `better-sqlite3` v13 is N-API-based (portable prebuilt binaries
+  across Node versions) and more mature for versioned migrations.
 - **No Telegram/Jupiter/Solana SDK dependency**: all four external services are called
-  directly over `fetch`, since none of what Phase 1-2 needs justifies an extra
-  dependency.
+  directly over `fetch`.

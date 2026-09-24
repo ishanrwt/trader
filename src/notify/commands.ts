@@ -10,10 +10,13 @@ export interface CommandsTelegram {
 
 export const PAUSED_KEY = "paused";
 export const PAUSE_REASON_KEY = "pauseReason";
+export const KILLED_VIA_COMMAND_KEY = "killedViaCommand";
+export const CONSECUTIVE_ERRORS_KEY = "consecutiveErrors";
 
 /**
- * SPEC.md section 10: /status, /pause, /resume, restricted to the configured
- * chat. Unknown commands and messages from other chats are ignored silently.
+ * SPEC.md section 10: /status, /report, /pause, /resume, /killswitch,
+ * restricted to the configured chat. Unknown commands and messages from
+ * other chats are ignored silently.
  */
 export async function pollAndHandleCommands(ctx: {
   telegram: CommandsTelegram;
@@ -21,7 +24,10 @@ export async function pollAndHandleCommands(ctx: {
   offset: number;
   timeoutSec: number;
   buildDigest: () => string;
+  buildReport: () => string;
   logger: Logger;
+  /** Audit trail (storage/events.ts) — optional so tests that don't care about it can omit it. */
+  recordEvent?: (type: string, message: string) => void;
 }): Promise<{ nextOffset: number }> {
   const updates = await ctx.telegram.getUpdates(ctx.offset, ctx.timeoutSec);
   let nextOffset = ctx.offset;
@@ -41,23 +47,44 @@ export async function pollAndHandleCommands(ctx: {
 
 async function handleCommand(
   text: string,
-  ctx: { telegram: CommandsTelegram; stateStore: StateStore; buildDigest: () => string; logger: Logger },
+  ctx: {
+    telegram: CommandsTelegram;
+    stateStore: StateStore;
+    buildDigest: () => string;
+    buildReport: () => string;
+    logger: Logger;
+    recordEvent?: (type: string, message: string) => void;
+  },
 ): Promise<void> {
   switch (text) {
     case "/status":
       await ctx.telegram.sendMessage(ctx.buildDigest());
       break;
+    case "/report":
+      await ctx.telegram.sendMessage(ctx.buildReport());
+      break;
     case "/pause":
       ctx.stateStore.set(PAUSED_KEY, true);
       ctx.stateStore.set(PAUSE_REASON_KEY, "manual");
       ctx.logger.info("Entries paused via /pause");
+      ctx.recordEvent?.("pause", "Entries paused via /pause");
       await ctx.telegram.sendMessage("Entries paused.");
       break;
     case "/resume":
+      // Clears pause, error halts and the kill switch (SPEC.md section 9.2) — but NOT the daily-loss halt (section 9.1).
       ctx.stateStore.set(PAUSED_KEY, false);
       ctx.stateStore.set(PAUSE_REASON_KEY, null);
+      ctx.stateStore.set(CONSECUTIVE_ERRORS_KEY, 0);
+      ctx.stateStore.set(KILLED_VIA_COMMAND_KEY, false);
       ctx.logger.info("Entries resumed via /resume");
-      await ctx.telegram.sendMessage("Entries resumed.");
+      ctx.recordEvent?.("resume", "Entries resumed via /resume");
+      await ctx.telegram.sendMessage("Entries resumed. (If a KILL file is present, delete it too.)");
+      break;
+    case "/killswitch":
+      ctx.stateStore.set(KILLED_VIA_COMMAND_KEY, true);
+      ctx.logger.warn("Kill switch activated via /killswitch");
+      ctx.recordEvent?.("killswitch", "Kill switch activated via /killswitch");
+      await ctx.telegram.sendMessage("Kill switch activated: entries halted, closing all open positions.");
       break;
     default:
       break; // unknown commands are ignored silently

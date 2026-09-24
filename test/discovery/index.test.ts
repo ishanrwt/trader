@@ -93,11 +93,26 @@ describe("recheckPending", () => {
 
     const result = await recheckPending({ dexClient: makeClient(fetchImpl), store, now: 1000, ...baseOpts });
 
-    expect(result).toMatchObject({ checked: 1, passed: 1, removedPermanent: 0, removedAged: 0 });
+    expect(result).toMatchObject({ checked: 1, passed: 1, eligible: 1, removedPermanent: 0, removedAged: 0 });
     const row = store.listPending()[0]!;
     expect(row.status).toBe("pending"); // Phase 1 has no READY state
     expect(row.firstEligibleAt).toBe(1000);
     expect(row.lastGateResult).toBe("passed");
+  });
+
+  it("counts eligible only the first time firstEligibleAt is set, not on later passing rechecks", async () => {
+    const db = openDb(":memory:");
+    const store = new PendingStore(db);
+    store.addPending("MINT1", 0);
+
+    const fetch1 = vi.fn().mockResolvedValueOnce(jsonOnce([pairFor("MINT1", 20_000)]));
+    const first = await recheckPending({ dexClient: makeClient(fetch1), store, now: 1000, ...baseOpts });
+    expect(first.eligible).toBe(1);
+
+    const fetch2 = vi.fn().mockResolvedValueOnce(jsonOnce([pairFor("MINT1", 20_000)]));
+    const second = await recheckPending({ dexClient: makeClient(fetch2), store, now: 2000, ...baseOpts });
+    expect(second.eligible).toBe(0);
+    expect(second.passed).toBe(1);
   });
 
   it("removes a mint after MAX_NO_PAIR_CHECKS consecutive no-pair checks", async () => {
@@ -137,7 +152,7 @@ describe("recheckPending", () => {
     const result = await recheckPending({ dexClient: makeClient(fetchImpl), store, now, ...baseOpts });
 
     expect(result.removedPermanent).toBe(1);
-    expect(result.skipReasons.entryWindow).toBe(1);
+    expect(result.skippedMints.entryWindow).toEqual(["MINT1"]);
     expect(store.countPending()).toBe(0);
   });
 
@@ -149,10 +164,26 @@ describe("recheckPending", () => {
 
     const result = await recheckPending({ dexClient: makeClient(fetchImpl), store, now: 1000, ...baseOpts });
 
-    expect(result.skipReasons.liquidity).toBe(1);
+    expect(result.skippedMints.liquidity).toEqual(["MINT1"]);
     const row = store.listPending()[0]!;
     expect(row.status).toBe("pending");
     expect(row.noPairChecks).toBe(0);
+  });
+
+  it("returns the failing mint again on each call, leaving de-duplication to the caller's per-window Set", async () => {
+    const db = openDb(":memory:");
+    const store = new PendingStore(db);
+    store.addPending("MINT1", 0);
+
+    const skippedMintsAcrossWindow = new Set<string>();
+    for (let i = 0; i < 5; i++) {
+      const fetchImpl = vi.fn().mockResolvedValueOnce(jsonOnce([pairFor("MINT1", 500)]));
+      const result = await recheckPending({ dexClient: makeClient(fetchImpl), store, now: 1000 + i, ...baseOpts });
+      expect(result.skippedMints.liquidity).toEqual(["MINT1"]); // every call reports it again
+      for (const mint of result.skippedMints.liquidity ?? []) skippedMintsAcrossWindow.add(mint);
+    }
+    // 5 evaluations of the same mint collapse to 1 unique mint for the window.
+    expect(skippedMintsAcrossWindow.size).toBe(1);
   });
 
   it("batches pending mints into groups of at most 30 per DexScreener call", async () => {
@@ -181,5 +212,143 @@ describe("recheckPending", () => {
     expect(result.checked).toBe(0);
     expect(result.failedBatches).toBe(1);
     expect(store.countPending()).toBe(1);
+  });
+
+  describe("Phase 2: checks 5-8 via the phase2 deps", () => {
+    function readyPair(mint: string) {
+      return {
+        ...pairFor(mint, 20_000),
+        priceChange: { m5: 5, h1: 10, h24: 20 },
+        txns: { m5: { buys: 8, sells: 4 } },
+        volume: { m5: 2000 },
+      };
+    }
+
+    const M56_CFG = { minM5ChangePct: 0, minH1ChangePct: 0, minH24ChangePct: 0, maxH1ChangePct: 0, minM5Txns: 10, minM5BuySellRatio: 1, minM5VolumeUsd: 1000 };
+
+    it("reaches READY when checks 5-8 all pass, stores a snapshot, and fires onNewlyReady exactly once", async () => {
+      const fetchImpl = vi.fn().mockResolvedValueOnce(jsonOnce([readyPair("MINT1")]));
+      const db = openDb(":memory:");
+      const store = new PendingStore(db);
+      store.addPending("MINT1", 0);
+      const onNewlyReady = vi.fn();
+
+      const phase2 = {
+        momentumBuyPressureCfg: M56_CFG,
+        getMintSafety: vi.fn().mockResolvedValue({ passed: true, reason: "ok" }),
+        getHolders: vi.fn().mockResolvedValue({ passed: true, reason: "ok", top1Pct: 5, top10Pct: 20 }),
+        computeSnapshot: () => ({ score: 0.7, snapshotJson: JSON.stringify({ score: 0.7 }) }),
+        onNewlyReady,
+      };
+
+      const result = await recheckPending({ dexClient: makeClient(fetchImpl), store, now: 1000, ...baseOpts, phase2 });
+      expect(result.ready).toBe(1);
+      const row = store.listReady()[0]!;
+      expect(row.mint).toBe("MINT1");
+      expect(row.snapshot).toBe(JSON.stringify({ score: 0.7 }));
+      expect(onNewlyReady).toHaveBeenCalledTimes(1);
+      expect(onNewlyReady).toHaveBeenCalledWith("MINT1", expect.objectContaining({ baseToken: { address: "MINT1" } }));
+    });
+
+    it("does not re-fire onNewlyReady on a later recheck that's still READY", async () => {
+      const db = openDb(":memory:");
+      const store = new PendingStore(db);
+      store.addPending("MINT1", 0);
+      const onNewlyReady = vi.fn();
+      const phase2 = {
+        momentumBuyPressureCfg: M56_CFG,
+        getMintSafety: vi.fn().mockResolvedValue({ passed: true, reason: "ok" }),
+        getHolders: vi.fn().mockResolvedValue({ passed: true, reason: "ok", top1Pct: 5, top10Pct: 20 }),
+        computeSnapshot: () => ({ score: 0.7, snapshotJson: "{}" }),
+        onNewlyReady,
+      };
+
+      await recheckPending({
+        dexClient: makeClient(vi.fn().mockResolvedValueOnce(jsonOnce([readyPair("MINT1")]))),
+        store,
+        now: 1000,
+        ...baseOpts,
+        phase2,
+      });
+      await recheckPending({
+        dexClient: makeClient(vi.fn().mockResolvedValueOnce(jsonOnce([readyPair("MINT1")]))),
+        store,
+        now: 2000,
+        ...baseOpts,
+        phase2,
+      });
+      expect(onNewlyReady).toHaveBeenCalledTimes(1);
+    });
+
+    it("check 7 (mint safety) failing is permanent: removed from pending, not marked READY", async () => {
+      const db = openDb(":memory:");
+      const store = new PendingStore(db);
+      store.addPending("MINT1", 0);
+      const phase2 = {
+        momentumBuyPressureCfg: M56_CFG,
+        getMintSafety: vi.fn().mockResolvedValue({ passed: false, reason: "mint authority not revoked" }),
+        getHolders: vi.fn(),
+        computeSnapshot: vi.fn(),
+        onNewlyReady: vi.fn(),
+      };
+      const result = await recheckPending({
+        dexClient: makeClient(vi.fn().mockResolvedValueOnce(jsonOnce([readyPair("MINT1")]))),
+        store,
+        now: 1000,
+        ...baseOpts,
+        phase2,
+      });
+      expect(result.removedPermanent).toBe(1);
+      expect(result.skippedMints.mintSafety).toEqual(["MINT1"]);
+      expect(store.countPending()).toBe(0);
+      expect(phase2.getHolders).not.toHaveBeenCalled(); // never reached
+    });
+
+    it("check 8 (holders) failing is temporary: stays pending, not READY", async () => {
+      const db = openDb(":memory:");
+      const store = new PendingStore(db);
+      store.addPending("MINT1", 0);
+      const phase2 = {
+        momentumBuyPressureCfg: M56_CFG,
+        getMintSafety: vi.fn().mockResolvedValue({ passed: true, reason: "ok" }),
+        getHolders: vi.fn().mockResolvedValue({ passed: false, reason: "top1 too concentrated", top1Pct: 50, top10Pct: 80 }),
+        computeSnapshot: vi.fn(),
+        onNewlyReady: vi.fn(),
+      };
+      const result = await recheckPending({
+        dexClient: makeClient(vi.fn().mockResolvedValueOnce(jsonOnce([readyPair("MINT1")]))),
+        store,
+        now: 1000,
+        ...baseOpts,
+        phase2,
+      });
+      expect(result.skippedMints.holders).toEqual(["MINT1"]);
+      expect(result.ready).toBe(0);
+      const row = store.listPending()[0]!;
+      expect(row.status).toBe("pending");
+    });
+
+    it("checks 5-6 failing (momentum/buy pressure) never reach RPC", async () => {
+      const db = openDb(":memory:");
+      const store = new PendingStore(db);
+      store.addPending("MINT1", 0);
+      const weakPair = { ...pairFor("MINT1", 20_000), priceChange: { m5: 0, h1: 0, h24: 0 }, txns: { m5: { buys: 1, sells: 1 } }, volume: { m5: 0 } };
+      const phase2 = {
+        momentumBuyPressureCfg: M56_CFG,
+        getMintSafety: vi.fn(),
+        getHolders: vi.fn(),
+        computeSnapshot: vi.fn(),
+        onNewlyReady: vi.fn(),
+      };
+      const result = await recheckPending({
+        dexClient: makeClient(vi.fn().mockResolvedValueOnce(jsonOnce([weakPair]))),
+        store,
+        now: 1000,
+        ...baseOpts,
+        phase2,
+      });
+      expect(result.skippedMints.momentum).toEqual(["MINT1"]);
+      expect(phase2.getMintSafety).not.toHaveBeenCalled();
+    });
   });
 });

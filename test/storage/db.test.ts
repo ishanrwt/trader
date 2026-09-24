@@ -6,14 +6,26 @@ describe("openDb / runMigrations", () => {
   it("creates the Phase 1 tables from an empty database", () => {
     const db = openDb(":memory:");
     expect(tableNames(db)).toEqual(
-      expect.arrayContaining(["seen_mints", "pending", "state", "events"]),
+      expect.arrayContaining([
+        "seen_mints",
+        "pending",
+        "state",
+        "events",
+        "positions",
+        "position_history",
+        "trades",
+        "shadows",
+        "skip_tracks",
+        "post_exit_tracks",
+        "safety_cache",
+      ]),
     );
     db.close();
   });
 
   it("sets PRAGMA user_version to the latest migration number", () => {
     const db = openDb(":memory:");
-    expect(db.pragma("user_version", { simple: true })).toBe(1);
+    expect(db.pragma("user_version", { simple: true })).toBe(2);
     db.close();
   });
 
@@ -21,7 +33,7 @@ describe("openDb / runMigrations", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     expect(() => runMigrations(db)).not.toThrow();
-    expect(db.pragma("user_version", { simple: true })).toBe(1);
+    expect(db.pragma("user_version", { simple: true })).toBe(2);
     db.close();
   });
 

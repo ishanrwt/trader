@@ -34,6 +34,7 @@ describe("PendingStore", () => {
         status: "pending",
         lastCheckedAt: null,
         lastGateResult: null,
+        snapshot: null,
       },
     ]);
   });
@@ -54,6 +55,17 @@ describe("PendingStore", () => {
     expect(row.firstEligibleAt).toBe(1500);
     expect(row.lastGateResult).toBe("passed");
     expect(row.noPairChecks).toBe(0);
+  });
+
+  it("patches the snapshot column and lists only READY rows via listReady", () => {
+    const store = new PendingStore(openDb(":memory:"));
+    store.addPending("MINT1", 1000);
+    store.addPending("MINT2", 1000);
+    store.updatePending("MINT1", { status: "READY", snapshot: JSON.stringify({ score: 0.5 }) });
+
+    expect(store.listReady()).toEqual([
+      expect.objectContaining({ mint: "MINT1", status: "READY", snapshot: JSON.stringify({ score: 0.5 }) }),
+    ]);
   });
 
   it("removes a pending row", () => {

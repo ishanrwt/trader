@@ -1,9 +1,16 @@
-import { selectPair, type DexScreenerClient } from "../clients/dexscreener.js";
+import { selectAllValidPairs, selectPair, type DexScreenerClient } from "../clients/dexscreener.js";
 import { SOLANA_CHAIN_ID } from "../constants.js";
-import { evaluatePhase1Gate, type GateCheckId } from "../gate/index.js";
+import {
+  evaluateMomentumAndBuyPressure,
+  evaluatePhase1Gate,
+  type GateCheckId,
+  type HoldersResult,
+  type MintSafetyResult,
+  type MomentumBuyPressureConfig,
+} from "../gate/index.js";
 import type { Logger } from "../logger/index.js";
 import type { DexPair } from "../types.js";
-import type { PendingStore } from "./pendingStore.js";
+import type { PendingRow, PendingStore } from "./pendingStore.js";
 
 const PAIRS_BATCH_SIZE = 30;
 
@@ -54,11 +61,34 @@ export async function pollProfiles(opts: {
 export interface RecheckPendingResult {
   checked: number;
   passed: number;
+  /** Mints whose firstEligibleAt was newly set this call (crossed MIN_LIQUIDITY_USD for the first time). */
+  eligible: number;
+  /** Mints that passed all 8 checks this call (Phase 2 only; 0 without `phase2` deps). */
+  ready: number;
   removedPermanent: number;
   removedAged: number;
-  skipReasons: Partial<Record<GateCheckId, number>>;
+  /**
+   * Mint addresses that failed each check this call. The caller (digest funnel)
+   * de-dupes these into a per-window Set so a mint re-evaluated every recheck
+   * cycle is only counted once per reason, not once per evaluation.
+   */
+  skippedMints: Partial<Record<GateCheckId, string[]>>;
   /** Number of pair-fetch batches that failed (for outage/health tracking). */
   failedBatches: number;
+  /** Mints removed this call that never reached READY (section 11.3: skip tracking). */
+  removedNeverReady: Array<{ mint: string; reason: string }>;
+}
+
+export interface Phase2GateDeps {
+  momentumBuyPressureCfg: MomentumBuyPressureConfig;
+  /** Resolves from safety_cache (permanent) or fetches + caches via RPC on a miss (SPEC.md section 5, check 7). */
+  getMintSafety: (mint: string) => Promise<MintSafetyResult>;
+  /** Resolves from a HOLDERS_CACHE_MIN cache or fetches + caches via RPC on a miss (section 5, check 8). */
+  getHolders: (mint: string, validPairs: readonly DexPair[]) => Promise<HoldersResult>;
+  /** Score + JSON snapshot to store on the pending row once a mint reaches READY (section 6.1, section 6.2's cached snapshot). */
+  computeSnapshot: (row: PendingRow, pair: DexPair, holders: HoldersResult) => { score: number; snapshotJson: string };
+  /** Fired the first time a mint transitions to READY (section 11.2: every mint gets a shadow the first time it becomes READY). */
+  onNewlyReady: (mint: string, pair: DexPair) => void;
 }
 
 /**
@@ -79,14 +109,19 @@ export async function recheckPending(opts: {
   maxNoPairChecks: number;
   reentryEnabled: boolean;
   logger: Logger;
+  /** Checks 5-8 (Phase 2). Omit to keep Phase 1 behavior: checks 1-4 only, never READY. */
+  phase2?: Phase2GateDeps;
 }): Promise<RecheckPendingResult> {
   const result: RecheckPendingResult = {
     checked: 0,
     passed: 0,
+    eligible: 0,
+    ready: 0,
     removedPermanent: 0,
     removedAged: 0,
-    skipReasons: {},
+    skippedMints: {},
     failedBatches: 0,
+    removedNeverReady: [],
   };
 
   const rows = opts.store.listPending();
@@ -113,6 +148,7 @@ export async function recheckPending(opts: {
       if (opts.now - row.discoveredAt > opts.maxPendingAgeMin * 60_000) {
         opts.store.removePending(row.mint);
         result.removedAged++;
+        if (row.status !== "READY") result.removedNeverReady.push({ mint: row.mint, reason: "aged_out" });
         continue;
       }
 
@@ -130,22 +166,81 @@ export async function recheckPending(opts: {
 
       if (gateResult.outcome === "passed") {
         result.passed++;
+        if (row.firstEligibleAt === null) result.eligible++;
+
+        if (!opts.phase2) {
+          opts.store.updatePending(row.mint, {
+            firstEligibleAt: gateResult.firstEligibleAt,
+            lastCheckedAt: opts.now,
+            noPairChecks: 0,
+            lastGateResult: "passed",
+          });
+          continue;
+        }
+
+        // Checks 5-6 (pair-data only, no RPC).
+        const check56 = evaluateMomentumAndBuyPressure(pair!, opts.phase2.momentumBuyPressureCfg);
+        if (!check56.passed) {
+          (result.skippedMints[check56.check] ??= []).push(row.mint);
+          opts.store.updatePending(row.mint, {
+            firstEligibleAt: gateResult.firstEligibleAt,
+            lastCheckedAt: opts.now,
+            noPairChecks: 0,
+            status: "pending",
+            lastGateResult: check56.reason,
+          });
+          continue;
+        }
+
+        // Check 7 (permanent, cached forever): only reached once checks 1-6 clear, to avoid spending RPC budget on mints that would fail anyway.
+        const safety = await opts.phase2.getMintSafety(row.mint);
+        if (!safety.passed) {
+          (result.skippedMints.mintSafety ??= []).push(row.mint);
+          opts.store.removePending(row.mint);
+          result.removedPermanent++;
+          result.removedNeverReady.push({ mint: row.mint, reason: "mintSafety" });
+          continue;
+        }
+
+        // Check 8 (temporary, cached HOLDERS_CACHE_MIN).
+        const validPairs = selectAllValidPairs(pairs, row.mint, opts.allowedQuoteMints);
+        const holders = await opts.phase2.getHolders(row.mint, validPairs);
+        if (!holders.passed) {
+          (result.skippedMints.holders ??= []).push(row.mint);
+          opts.store.updatePending(row.mint, {
+            firstEligibleAt: gateResult.firstEligibleAt,
+            lastCheckedAt: opts.now,
+            noPairChecks: 0,
+            status: "pending",
+            lastGateResult: holders.reason,
+          });
+          continue;
+        }
+
+        // All 8 checks passed: READY.
+        result.ready++;
+        const wasReady = row.status === "READY";
+        const { snapshotJson } = opts.phase2.computeSnapshot(row, pair!, holders);
         opts.store.updatePending(row.mint, {
           firstEligibleAt: gateResult.firstEligibleAt,
           lastCheckedAt: opts.now,
           noPairChecks: 0,
-          lastGateResult: "passed",
+          status: "READY",
+          lastGateResult: "READY",
+          snapshot: snapshotJson,
         });
+        if (!wasReady) opts.phase2.onNewlyReady(row.mint, pair!);
         continue;
       }
 
-      result.skipReasons[gateResult.check] = (result.skipReasons[gateResult.check] ?? 0) + 1;
+      (result.skippedMints[gateResult.check] ??= []).push(row.mint);
 
       if (gateResult.check === "pair") {
         const noPairChecks = row.noPairChecks + 1;
         if (noPairChecks >= opts.maxNoPairChecks) {
           opts.store.removePending(row.mint);
           result.removedPermanent++;
+          if (row.status !== "READY") result.removedNeverReady.push({ mint: row.mint, reason: "pair" });
         } else {
           opts.store.updatePending(row.mint, {
             noPairChecks,
@@ -159,6 +254,7 @@ export async function recheckPending(opts: {
       if (gateResult.outcome === "permanent_fail") {
         opts.store.removePending(row.mint);
         result.removedPermanent++;
+        if (row.status !== "READY") result.removedNeverReady.push({ mint: row.mint, reason: gateResult.check });
         continue;
       }
 

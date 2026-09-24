@@ -8,6 +8,8 @@ export interface PendingRow {
   status: string;
   lastCheckedAt: number | null;
   lastGateResult: string | null;
+  /** JSON snapshot of the latest pair data + score/components, set once a mint reaches READY (Phase 2). */
+  snapshot: string | null;
 }
 
 interface PendingRowDb {
@@ -18,6 +20,7 @@ interface PendingRowDb {
   status: string;
   last_checked_at: number | null;
   last_gate_result: string | null;
+  snapshot: string | null;
 }
 
 function fromDb(row: PendingRowDb): PendingRow {
@@ -29,11 +32,12 @@ function fromDb(row: PendingRowDb): PendingRow {
     status: row.status,
     lastCheckedAt: row.last_checked_at,
     lastGateResult: row.last_gate_result,
+    snapshot: row.snapshot,
   };
 }
 
 export type PendingPatch = Partial<
-  Pick<PendingRow, "firstEligibleAt" | "noPairChecks" | "lastCheckedAt" | "lastGateResult" | "status">
+  Pick<PendingRow, "firstEligibleAt" | "noPairChecks" | "lastCheckedAt" | "lastGateResult" | "status" | "snapshot">
 >;
 
 /** DB access for `seen_mints` and `pending` (SPEC.md section 4). */
@@ -76,9 +80,14 @@ export class PendingStore {
     const next = { ...fromDb(current), ...patch };
     this.db
       .prepare(
-        "UPDATE pending SET first_eligible_at = ?, no_pair_checks = ?, last_checked_at = ?, last_gate_result = ?, status = ? WHERE mint = ?",
+        "UPDATE pending SET first_eligible_at = ?, no_pair_checks = ?, last_checked_at = ?, last_gate_result = ?, status = ?, snapshot = ? WHERE mint = ?",
       )
-      .run(next.firstEligibleAt, next.noPairChecks, next.lastCheckedAt, next.lastGateResult, next.status, mint);
+      .run(next.firstEligibleAt, next.noPairChecks, next.lastCheckedAt, next.lastGateResult, next.status, next.snapshot, mint);
+  }
+
+  listReady(): PendingRow[] {
+    const rows = this.db.prepare("SELECT * FROM pending WHERE status = 'READY' ORDER BY discovered_at ASC").all() as PendingRowDb[];
+    return rows.map(fromDb);
   }
 
   removePending(mint: string): void {
