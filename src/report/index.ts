@@ -370,9 +370,19 @@ export function formatTradeDetail(trades: readonly TradeDetailRecord[], opts: { 
     lines.push(`  entry valuation (first exit-lane quote after fill): ${fmtPctOrNa(t.entryValuationPnlPct)}`);
     lines.push(`  entry quote (raw): ${fmtQuote(t.entryQuoteInAmount, t.entryQuoteOutAmount)}`);
     lines.push(`  exit quote (raw): ${fmtQuote(t.exitQuoteInAmount, t.exitQuoteOutAmount)}`);
-    const shown = t.history.slice(0, historyPoints).map((p) => `(${p.t}, ${p.pnl.toFixed(2)}%)`);
-    const more = t.history.length > historyPoints ? `, +${t.history.length - historyPoints} more` : "";
-    lines.push(`  history (first ${historyPoints} of ${t.history.length}): ${shown.length > 0 ? shown.join(", ") + more : "none"}`);
+    const fmtPoints = (pts: readonly TradeDetailHistoryPoint[]) => pts.map((p) => `(${p.t}, ${p.pnl.toFixed(2)}%)`).join(", ");
+    if (t.history.length === 0) {
+      lines.push(`  history (first ${historyPoints} of 0): none`);
+    } else if (t.history.length <= historyPoints) {
+      // The whole history already fits in one line — a separate "last N" line would just repeat it.
+      lines.push(`  history (${t.history.length} of ${t.history.length}): ${fmtPoints(t.history)}`);
+    } else {
+      const first = t.history.slice(0, historyPoints);
+      const last = t.history.slice(-historyPoints);
+      const between = Math.max(0, t.history.length - first.length - last.length);
+      lines.push(`  history, first ${historyPoints} of ${t.history.length}: ${fmtPoints(first)}`);
+      lines.push(`  history, last ${historyPoints} of ${t.history.length}${between > 0 ? ` (${between} more in between)` : ""}: ${fmtPoints(last)}`);
+    }
     lines.push("");
   }
   return lines.join("\n").trimEnd();

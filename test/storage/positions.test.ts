@@ -1,6 +1,10 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { PositionsStore, positionRowToExitState, type NewPositionRow } from "../../src/storage/positions.js";
 import { openDb } from "../../src/storage/db.js";
+import { step, type ExitStateMachineConfig } from "../../src/monitor/stateMachine.js";
 
 function newRow(overrides: Partial<NewPositionRow> = {}): NewPositionRow {
   return {
@@ -126,5 +130,67 @@ describe("PositionsStore", () => {
     expect(state.deadline).toBe(5000);
     expect(state.currentTarget).toBe(40);
     expect(state.history).toEqual([{ t: 1000, pnl: 0 }]);
+  });
+
+  describe("the -Infinity peakPnl sentinel survives a real file-based restart", () => {
+    const CFG: ExitStateMachineConfig = {
+      stopLossPct: 15,
+      extraTargetPct: 10,
+      maxTargetExtensions: 1,
+      holdMinutes: 15,
+      fastGainPct: 15,
+      fastWindowMinutes: 5,
+      fastMinHistorySec: 60,
+      fastConfirmPolls: 2,
+      maxTimerRestarts: 3,
+      maxTotalHoldMinutes: 60,
+      trailPct: 4,
+      breakevenTriggerPct: 20,
+      breakevenFloorPct: 2,
+      flatBandPct: 3,
+      liqDropExitPct: 30,
+      liqDropConfirmReads: 2,
+      noRouteExitSec: 30,
+    };
+
+    it("round-trips through an actual on-disk database, and Math.max still takes the first real poll's value after a simulated process restart", () => {
+      // A real file, not :memory: — :memory: is destroyed on close, so it can't
+      // actually simulate "the process died and a new one opened the same file."
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "trader-peakpnl-restart-"));
+      const dbPath = path.join(dir, "trader.db");
+      try {
+        // Process 1: opens the position with no entry valuation (the quote-failure
+        // fallback) — peakPnl = -Infinity, no history point recorded.
+        const db1 = openDb(dbPath);
+        const store1 = new PositionsStore(db1);
+        const id = store1.insert(newRow({ peakPnl: Number.NEGATIVE_INFINITY, deadline: 900_000 }));
+        expect(store1.loadHistory(id, 0)).toEqual([]); // nothing recorded yet, as the fallback intends
+        db1.close();
+
+        // Process 2 ("after a restart"): a fresh Database connection to the same file.
+        const db2 = openDb(dbPath);
+        const store2 = new PositionsStore(db2);
+        const row = store2.get(id)!;
+
+        // The crux of the concern: peakPnl must still be exactly -Infinity here, not
+        // null (which a JSON round-trip would silently produce, per JSON.stringify(-Infinity) === "null").
+        expect(row.peakPnl).toBe(Number.NEGATIVE_INFINITY);
+        expect(Number.isNaN(row.peakPnl)).toBe(false);
+
+        const history = store2.loadHistory(id, 0);
+        expect(history).toEqual([]);
+        const state = positionRowToExitState(row, history);
+        expect(state.peakPnl).toBe(Number.NEGATIVE_INFINITY);
+
+        // The first poll after the restart: if peakPnl had silently become null/0
+        // (the JSON-coercion failure mode), Math.max(0, -8) would wrongly floor the
+        // peak at 0. With the real -Infinity carried through, it correctly becomes -8.
+        const result = step(state, { now: 1000, pnlPct: -8 }, CFG);
+        expect(result.newState.peakPnl).toBe(-8);
+        db2.close();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });

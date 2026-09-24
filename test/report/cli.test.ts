@@ -100,7 +100,31 @@ describe("report CLI entry point (src/report/cli.ts), not just the report functi
       expect(output).toContain(`=== Trade ${tradeId}: FOO (MINT1) ===`);
       expect(output).toContain("tokens received: 68306.48291  decimals: 6");
       expect(output).toContain("entry valuation (first exit-lane quote after fill): -3.20%");
-      expect(output).toContain("history (first 5 of 2): (1000, -3.20%), (1010, -1.10%)");
+      expect(output).toContain("history (2 of 2): (1000, -3.20%), (1010, -1.10%)");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("--trades shows both the first 5 and last 5 trade_history points when there are more than 10", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "trader-report-cli-trades-long-"));
+    const dbPath = path.join(tmpDir, "trader.db");
+    try {
+      const tradeId = seedTrade(dbPath);
+      const db = openDb(dbPath);
+      const points = Array.from({ length: 12 }, (_, i) => ({ t: i * 1000, pnl: i }));
+      new TradeHistoryStore(db).insertMany(tradeId, points);
+      db.close();
+
+      const output = execFileSync(process.execPath, ["--import", TSX_LOADER_URL, CLI_PATH, "--db", dbPath, "--trades"], {
+        cwd: tmpDir,
+        env: { PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "" },
+        encoding: "utf8",
+      });
+
+      expect(output).toContain("history, first 5 of 12:");
+      expect(output).toContain("history, last 5 of 12");
+      expect(output).toContain("(11000, 11.00%)"); // the actual last point, not truncated away
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

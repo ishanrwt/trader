@@ -294,7 +294,7 @@ describe("formatTradeDetail", () => {
     expect(text).toContain("entry valuation (first exit-lane quote after fill): -3.20%");
     expect(text).toContain("entry quote (raw): in=25000000 out=68306482910");
     expect(text).toContain("exit quote (raw): in=68306482910 out=19853020");
-    expect(text).toContain("history (first 5 of 3): (1000, -3.20%), (11000, -5.10%), (21000, -12.40%)");
+    expect(text).toContain("history (3 of 3): (1000, -3.20%), (11000, -5.10%), (21000, -12.40%)");
   });
 
   it("shows n/a for missing entry valuation, quote amounts, and history — never a crash", () => {
@@ -323,12 +323,30 @@ describe("formatTradeDetail", () => {
     expect(text).toContain("peak: n/a");
   });
 
-  it("truncates history to the requested count and notes how many more there are", () => {
+  it("shows both first-N and last-N history points, not just the first N", () => {
+    const history = Array.from({ length: 12 }, (_, i) => ({ t: i * 1000, pnl: i }));
+    const text = formatTradeDetail([tradeDetail({ history })], { historyPoints: 5 });
+    expect(text).toContain("history, first 5 of 12: (0, 0.00%), (1000, 1.00%), (2000, 2.00%), (3000, 3.00%), (4000, 4.00%)");
+    expect(text).toContain(
+      "history, last 5 of 12 (2 more in between): (7000, 7.00%), (8000, 8.00%), (9000, 9.00%), (10000, 10.00%), (11000, 11.00%)",
+    );
+  });
+
+  it("when first-N and last-N overlap (a short excess over the limit), shows the overlapping points in both without claiming a negative gap", () => {
     const text = formatTradeDetail(
       [tradeDetail({ history: [{ t: 1, pnl: 1 }, { t: 2, pnl: 2 }, { t: 3, pnl: 3 }] })],
       { historyPoints: 2 },
     );
-    expect(text).toContain("history (first 2 of 3): (1, 1.00%), (2, 2.00%), +1 more");
+    expect(text).toContain("history, first 2 of 3: (1, 1.00%), (2, 2.00%)");
+    expect(text).toContain("history, last 2 of 3: (2, 2.00%), (3, 3.00%)");
+    expect(text).not.toContain("more in between");
+  });
+
+  it("shows one combined line, not a redundant repeat, when the whole history already fits within the requested count", () => {
+    const text = formatTradeDetail([tradeDetail({ history: [{ t: 1, pnl: 1 }, { t: 2, pnl: 2 }] })], { historyPoints: 5 });
+    expect(text).toContain("history (2 of 2): (1, 1.00%), (2, 2.00%)");
+    expect(text).not.toContain("first 5");
+    expect(text).not.toContain("last 5");
   });
 
   it("handles multiple trades and an empty list", () => {
