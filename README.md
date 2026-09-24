@@ -104,10 +104,18 @@ builders.
 
 ```sh
 npm install -g pm2
-pm2 start "npx tsx src/index.ts" --name trader
+pm2 start src/index.ts --name trader --node-args="--import tsx/esm"
 pm2 logs trader
 pm2 stop trader
 ```
+
+`pm2 start "npx tsx src/index.ts"` (or passing `npx` as the script) does **not** work on
+Windows — pm2 tries to run the `.cmd` shim through Node's module loader and fails with
+`SyntaxError: Unexpected token ':'`. The form above runs `node --import tsx/esm
+src/index.ts` directly, in one process, which pm2 can track cleanly.
+
+**After editing `.env`, run `pm2 restart trader`** — pm2 does not reload environment
+files on its own; the running process keeps whatever values it started with.
 
 ### Linux: start on boot
 
@@ -146,6 +154,27 @@ pm2 save
 
 Either way, verify it survives a real reboot before relying on it — `pm2 status`
 after logging back in should still show `trader` as `online`.
+
+**Both options start the bot at Windows *login*, not at boot.** Neither Task
+Scheduler's "At log on" trigger nor `pm2-windows-startup` (a per-user Run-key entry)
+runs before someone actually logs in. After a Windows Update reboot on an unattended
+machine, `trader` stays stopped until a user logs in — there's no service-level
+autostart here. If you need it to survive unattended reboots, run it as a proper
+Windows Service (e.g. via [NSSM](https://nssm.cc/)) instead of through a login hook.
+
+### Before a planned shutdown or restart
+
+Don't just kill the process — an open position left mid-flight has no way to close
+itself once the bot stops polling it.
+
+1. Send `/pause` in Telegram. This stops new entries but leaves existing positions
+   under normal management (SPEC.md section 9.2).
+2. Wait until the digest (or `/status`) shows no open positions. Worst case this is
+   `MAX_TOTAL_HOLD_MINUTES` (default 60) after the last entry, since every position
+   is force-closed by then regardless of PnL.
+3. Now it's safe to stop (`pm2 stop trader`) and shut down / reboot.
+4. After restarting, send `/resume` — `/pause` is state persisted in `trader.db`, so
+   the bot comes back up still paused until you clear it.
 
 ## Project layout
 
