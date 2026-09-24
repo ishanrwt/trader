@@ -52,7 +52,7 @@ It is not part of the Cloudflare Worker in `../trends`. Never modify anything in
 - Pair data for up to 30 tokens: `GET https://api.dexscreener.com/tokens/v1/solana/{addr1,addr2,...}` (reported limit about 300 requests/min).
 - Verify both against the current docs. The sibling Worker repo (`../trends/src/index.js`) contains working DexScreener code you may read for reference; this spec wins where they differ.
 - Our limiter stays under `DEX_PROFILES_MAX_PER_MIN` for profiles and `DEX_PAIRS_MAX_PER_MIN` for pair data (shared by discovery, liquidity checks, shadows and tracking). On a 429 or 5xx, back off with jitter.
-- **Pair selection rule** (used everywhere a price or liquidity is needed): among a mint's pairs with `chainId` "solana" whose quote token is in `ALLOWED_QUOTE_MINTS`, use the one with the highest `liquidity.usd`. Ignore all other pairs. DexScreener occasionally misprices pairs quoted against other tokens.
+- **Pair selection rule** (used everywhere a price or liquidity is needed for a mint): among a mint's pairs with `chainId` "solana" where `baseToken.address` equals that mint and `quoteToken.address` is in `ALLOWED_QUOTE_MINTS`, use the one with the highest `liquidity.usd`. Ignore all other pairs, including ones where the mint appears only as the quote token. DexScreener occasionally misprices pairs quoted against other tokens.
 
 ### Jupiter
 
@@ -69,7 +69,7 @@ It is not part of the Cloudflare Worker in `../trends`. Never modify anything in
 
 ### SOL/USD price
 
-- Needed to convert SOL fees into USD. Refresh every 5 minutes from DexScreener (a SOL/USDC pair), never from Jupiter.
+- Needed to convert SOL fees into USD. Refresh every 5 minutes from DexScreener, never from Jupiter. Apply the pair selection rule above with the mint fixed to wrapped SOL: `baseToken.address` = wrapped SOL, `quoteToken.address` = USDC or USDT (whichever pair has the highest `liquidity.usd`).
 
 ## 4. Discovery
 
@@ -190,7 +190,7 @@ Checked before every entry. Open positions are always managed normally, whatever
 ### 9.3 Jupiter budget
 
 - One limiter: at most `JUPITER_MAX_REQ_PER_MIN` in any 60-second sliding window, and at least `JUPITER_MIN_INTERVAL_MS` between requests.
-- **Exit lane** (position sell quotes, confirmation quotes, exit fills, live sells and retries) always goes first. **Entry lane** (sellability, execution quotes, entry fills) only uses capacity left after reserving `exitReserve = MAX_CONCURRENT × ceil(60 / POLL_SECONDS) + EXIT_RESERVE_EXTRA_PER_MIN` per minute.
+- Track `exitUsed` and `entryUsed` separately over the 60-second window. **Exit lane** (position sell quotes, confirmation quotes, exit fills, live sells and retries) always goes first and is never blocked by entry usage. **Entry lane** (sellability, execution quotes, entry fills) is allowed only if `exitUsed + entryUsed + max(0, exitReserve − exitUsed) < JUPITER_MAX_REQ_PER_MIN`, where `exitReserve = MAX_CONCURRENT × ceil(60 / POLL_SECONDS) + EXIT_RESERVE_EXTRA_PER_MIN`.
 - **Startup validation**: `exitReserve + ENTRY_MIN_BUDGET_PER_MIN` must be ≤ `JUPITER_MAX_REQ_PER_MIN`. If not, refuse to start with a clear message, or, if `AUTO_STRETCH_POLL=true`, raise `POLL_SECONDS` until it fits and log it.
 - On a 429: back off with jitter; never retry faster than the limiter allows.
 - Count entry checks deferred for lack of budget (digest).
