@@ -1,15 +1,16 @@
 import path from "node:path";
+import { loadEnv } from "../config/loadEnv.js";
+import { loadReportConfig, ReportConfigError } from "../config/reportConfig.js";
 import { formatReport, type TradeRecord } from "./index.js";
 import { openDb } from "../storage/db.js";
 import { TradesStore } from "../storage/trades.js";
 import { SkipTracksStore } from "../storage/skipTracks.js";
 import { PositionsStore } from "../storage/positions.js";
-import { loadConfig } from "../config/index.js";
 import { shouldWriteOff } from "../executor/paper.js";
 import type { DexPair } from "../types.js";
 
-function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to?: string } {
-  const out: { mode?: "paper" | "live"; from?: string; to?: string } = {};
+function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to?: string; db?: string } {
+  const out: { mode?: "paper" | "live"; from?: string; to?: string; db?: string } = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--mode") {
@@ -21,15 +22,33 @@ function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to
     } else if (arg === "--to") {
       const value = argv[++i];
       if (value) out.to = value;
+    } else if (arg === "--db") {
+      const value = argv[++i];
+      if (value) out.db = value;
     }
   }
   return out;
 }
 
 function main(): void {
+  // The report only ever reads the local SQLite database — no secrets needed,
+  // so .env is loaded (for GOLIVE_*/STUCK_WRITE_OFF_MIN overrides, if present)
+  // but its absence, or a missing API key, is not an error here.
+  const { env } = loadEnv();
+
+  let config;
+  try {
+    config = loadReportConfig(env);
+  } catch (err) {
+    if (err instanceof ReportConfigError) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
+
   const opts = parseArgs(process.argv.slice(2));
-  const config = loadConfig(process.env);
-  const dbPath = path.join(process.cwd(), "trader.db");
+  const dbPath = opts.db ?? path.join(process.cwd(), "trader.db");
   const db = openDb(dbPath);
 
   const tradesStore = new TradesStore(db);

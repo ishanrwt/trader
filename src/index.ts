@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import dotenv from "dotenv";
 
 import { DexScreenerClient, selectAllValidPairs, selectPair } from "./clients/dexscreener.js";
 import { JupiterClient } from "./clients/jupiter.js";
 import { SolanaRpcClient } from "./clients/rpc.js";
 import { TelegramClient } from "./clients/telegram.js";
 import { ConfigError, KNOWN_ENV_KEYS, loadConfig, unknownKeys, type Config } from "./config/index.js";
+import { loadEnv } from "./config/loadEnv.js";
 import { SOLANA_CHAIN_ID, USDC_DECIMALS, USDC_MINT, WRAPPED_SOL_MINT } from "./constants.js";
 import { pollProfiles, recheckPending, type Phase2GateDeps } from "./discovery/index.js";
 import { PendingStore } from "./discovery/pendingStore.js";
@@ -64,7 +64,6 @@ import { VirtualWallet } from "./wallet/index.js";
 import type { DexPair } from "./types.js";
 
 const cwd = process.cwd();
-const ENV_PATH = path.join(cwd, ".env");
 const DB_PATH = path.join(cwd, "trader.db");
 const LOG_DIR = path.join(cwd, "logs");
 const KILL_PATH = path.join(cwd, "KILL");
@@ -102,16 +101,6 @@ async function runLoop(
     }
     await sleep(intervalMs, signal);
   }
-}
-
-function loadEnv(): { env: NodeJS.ProcessEnv; fileKeys: string[] } {
-  let fileKeys: string[] = [];
-  if (fs.existsSync(ENV_PATH)) {
-    const parsed = dotenv.parse(fs.readFileSync(ENV_PATH));
-    fileKeys = Object.keys(parsed);
-    dotenv.config({ path: ENV_PATH });
-  }
-  return { env: process.env, fileKeys };
 }
 
 interface FunnelCounters {
