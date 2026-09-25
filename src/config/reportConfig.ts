@@ -15,6 +15,10 @@ import { envSchema } from "./schema.js";
 const reportEnvSchema = envSchema.pick({
   TRADING_DAY_TZ: true,
   DIGEST_INTERVAL_MINUTES: true,
+  // The "as if live" replay (section 11.4) uses the current halt limits.
+  MAX_DAILY_LOSS_USD: true,
+  CONSECUTIVE_LOSS_PAUSE: true,
+  LOSS_PAUSE_MINUTES: true,
   STUCK_WRITE_OFF_MIN: true,
   GOLIVE_MIN_TRADES: true,
   GOLIVE_MIN_DAYS: true,

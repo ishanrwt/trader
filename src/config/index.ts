@@ -149,6 +149,9 @@ export function loadConfig(envSource: Record<string, string | undefined>): Confi
 /** SPEC.md sections 13 and 16.8: every check that only applies when MODE=live. */
 function liveIssues(raw: Omit<RawConfig, "WALLET_PRIVATE_KEY">, walletKey: string): string[] {
   const issues: string[] = [];
+  if (raw.PAPER_HALTS_OBSERVE_ONLY) {
+    issues.push("PAPER_HALTS_OBSERVE_ONLY=true is paper-only: MODE=live refuses to start with it on, because live halts must always block entries (section 9.1).");
+  }
   if (raw.LIVE_ACK !== LIVE_ACK_PHRASE) {
     issues.push(`MODE=live (Phase 3 live execution) requires LIVE_ACK=${LIVE_ACK_PHRASE} exactly (section 16.8).`);
   }

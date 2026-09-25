@@ -56,8 +56,8 @@ describe("migration 0005_trade_detail", () => {
          VALUES ('paper', 'P', 1, 25, 100, 25.05, 20000, ?, 30, 100000)`,
       ).run(JSON.stringify({ dexId: "meteora" }));
 
-      runMigrations(db); // applies 0005
-      expect(db.pragma("user_version", { simple: true })).toBe(5);
+      runMigrations(db); // applies 0005 (and any later migrations)
+      expect(db.pragma("user_version", { simple: true })).toBeGreaterThanOrEqual(5);
 
       const trades = new TradesStore(db).listAll();
       expect(trades.map((t) => [t.mint, t.dexId])).toEqual([

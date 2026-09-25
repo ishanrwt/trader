@@ -15,6 +15,12 @@ export interface WindowTrade {
   exitTime: number;
   netPnlUsd: number;
   proceedsUnknown: boolean;
+  /** Section 11.1 tag; anything other than "none" (or unrecorded) counts as taken under a would-be halt. */
+  wouldBlockAtEntry?: string | null;
+}
+
+function takenUnderHalt(t: WindowTrade): boolean {
+  return t.wouldBlockAtEntry !== undefined && t.wouldBlockAtEntry !== null && t.wouldBlockAtEntry !== "none";
 }
 
 export interface WindowFeeLoss {
@@ -33,6 +39,8 @@ export interface WindowRow {
   feeLossUsd: number;
   /** Sum of net PnL USD over known-proceeds trades, minus fee losses. */
   netUsd: number;
+  /** Trades whose entry was tagged with a would-be halt (section 11.1). */
+  underHalt: number;
   current: boolean;
 }
 
@@ -41,7 +49,7 @@ export interface WindowStatsResult {
   timeZone: string;
   intervalMin: number;
   rows: WindowRow[];
-  total: { trades: number; wins: number; proceedsUnknown: number; feeLossUsd: number; netUsd: number };
+  total: { trades: number; wins: number; proceedsUnknown: number; feeLossUsd: number; netUsd: number; underHalt: number };
 }
 
 const MINUTES_PER_DAY = 24 * 60;
@@ -82,6 +90,7 @@ export function windowStats(
       proceedsUnknown: 0,
       feeLossUsd: 0,
       netUsd: 0,
+      underHalt: 0,
       current: b === currentBucket,
     });
   }
@@ -89,6 +98,7 @@ export function windowStats(
     const row = rows[bucketOf(t.exitTime)];
     if (!row) continue; // after `now` (clock skew): nothing to show yet
     row.trades++;
+    if (takenUnderHalt(t)) row.underHalt++;
     if (t.proceedsUnknown) {
       row.proceedsUnknown++;
       continue;
@@ -103,13 +113,14 @@ export function windowStats(
     row.netUsd -= f.usd;
   }
 
-  const total = { trades: 0, wins: 0, proceedsUnknown: 0, feeLossUsd: 0, netUsd: 0 };
+  const total = { trades: 0, wins: 0, proceedsUnknown: 0, feeLossUsd: 0, netUsd: 0, underHalt: 0 };
   for (const r of rows) {
     total.trades += r.trades;
     total.wins += r.wins;
     total.proceedsUnknown += r.proceedsUnknown;
     total.feeLossUsd += r.feeLossUsd;
     total.netUsd += r.netUsd;
+    total.underHalt += r.underHalt;
   }
   return { day, timeZone, intervalMin, rows, total };
 }
@@ -124,11 +135,12 @@ function signedUsd(v: number): string {
   return `${r > 0 ? "+" : "-"}$${Math.abs(r).toFixed(2)}`;
 }
 
-function describe(s: { trades: number; wins: number; proceedsUnknown: number; feeLossUsd: number; netUsd: number }, live: boolean): string {
+function describe(s: { trades: number; wins: number; proceedsUnknown: number; feeLossUsd: number; netUsd: number; underHalt: number }, live: boolean): string {
   if (s.trades === 0 && s.feeLossUsd === 0) return "0 trades";
   const parts = [`${s.trades} ${s.trades === 1 ? "trade" : "trades"}`, `${s.wins} ${s.wins === 1 ? "win" : "wins"}`];
   if (live && s.feeLossUsd > 0) parts.push(`fee losses $${s.feeLossUsd.toFixed(2)}`);
   parts.push(`net ${signedUsd(s.netUsd)}`);
+  if (s.underHalt > 0) parts.push(`${s.underHalt} under would-be halt`);
   const line = parts.join(", ");
   return s.proceedsUnknown > 0 ? `${line} (${s.proceedsUnknown} proceeds unknown, not in wins or net)` : line;
 }
@@ -152,7 +164,7 @@ export function buildWindowsReport(db: Db, opts: { mode: string; day: string; ti
   const trades = new TradesStore(db)
     .listForTradingDay(opts.day)
     .filter((t) => t.mode === opts.mode)
-    .map((t) => ({ exitTime: t.exitTime, netPnlUsd: t.netPnlUsd, proceedsUnknown: t.proceedsUnknown }));
+    .map((t) => ({ exitTime: t.exitTime, netPnlUsd: t.netPnlUsd, proceedsUnknown: t.proceedsUnknown, wouldBlockAtEntry: t.wouldBlockAtEntry }));
   const feeLosses = new FeeLossesStore(db)
     .listAll({ mode: opts.mode, from: opts.day, to: opts.day })
     .map((f) => ({ ts: f.ts, usd: f.usd }));

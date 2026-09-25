@@ -1,7 +1,7 @@
 import path from "node:path";
 import { loadEnv } from "../config/loadEnv.js";
 import { loadReportConfig, ReportConfigError } from "../config/reportConfig.js";
-import { formatReport, formatTradeDetail, tradeRowToDetailRecord, type TradeRecord } from "./index.js";
+import { formatReport, formatTradeDetail, tradeRowToDetailRecord, type ReplayableTradeRecord } from "./index.js";
 import { buildWindowsReport } from "./windows.js";
 import { tradingDayKey } from "../time.js";
 import { openDb } from "../storage/db.js";
@@ -96,7 +96,7 @@ function main(): void {
     return;
   }
 
-  function toRecords(mode?: "paper" | "live", from?: string, to?: string): TradeRecord[] {
+  function toRecords(mode?: "paper" | "live", from?: string, to?: string): ReplayableTradeRecord[] {
     return tradesStore.listAll({ ...(mode ? { mode } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}) }).map((t) => {
       const snapshot = t.entryPairSnapshot as DexPair | null;
       return {
@@ -113,8 +113,10 @@ function main(): void {
         pairAgeMs: snapshot?.pairCreatedAt ? t.entryTime - snapshot.pairCreatedAt : null,
         top10Pct: t.top10Pct,
         score: t.score,
-        scoreComponents: t.scoreComponents as TradeRecord["scoreComponents"],
+        scoreComponents: t.scoreComponents as ReplayableTradeRecord["scoreComponents"],
         proceedsUnknown: t.proceedsUnknown,
+        entryTime: t.entryTime,
+        wouldBlockAtEntry: t.wouldBlockAtEntry,
       };
     });
   }
@@ -143,6 +145,22 @@ function main(): void {
         ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) }
         : {}),
       ...(opts.mode ? {} : { modeLabel: mode.toUpperCase() }),
+      // Section 11.4: paper also gets the "as if live" view, and the go-live checklist uses it.
+      ...(mode === "paper"
+        ? {
+            asIfLive: {
+              cfg: {
+                maxDailyLossUsd: config.MAX_DAILY_LOSS_USD,
+                consecutiveLossPause: config.CONSECUTIVE_LOSS_PAUSE,
+                lossPauseMinutes: config.LOSS_PAUSE_MINUTES,
+                tradingDayTz: config.TRADING_DAY_TZ,
+              },
+              allPaperTrades: toRecords("paper"),
+              ...(opts.from ? { from: opts.from } : {}),
+              ...(opts.to ? { to: opts.to } : {}),
+            },
+          }
+        : {}),
     }),
   );
   console.log(sections.join("\n\n"));

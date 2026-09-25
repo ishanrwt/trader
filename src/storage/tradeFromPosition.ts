@@ -60,6 +60,7 @@ export function tradeFromPosition(i: TradeFromPositionInput): NewTradeRow {
     dexId: row.dexId,
     stopPollPnlPct: row.stopPollPnlPct,
     stopConfirmPnlPct: row.stopConfirmPnlPct,
+    wouldBlockAtEntry: row.wouldBlockAtEntry,
     ...(extras.tradeLive ?? {}),
     proceedsUnknown: extras.proceedsUnknown ?? false,
   };

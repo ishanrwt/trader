@@ -5,7 +5,20 @@ import { tradingDayKey } from "../time.js";
  * loss pause are stored per mode, so paper never affects live limits and vice
  * versa. Migration 0004 copied the Phase 2 (paper-only) keys to their `:paper` names.
  */
-export function perModeKey(base: "dailyLossHaltDay" | "lossStreak" | "lossPauseUntil", mode: string): string {
+export type PerModeKeyBase =
+  | "dailyLossHaltDay"
+  | "lossStreak"
+  | "lossPauseUntil"
+  /** Net day loss (USD) when the daily-loss halt was recorded, for its alert. */
+  | "dailyLossHaltTotalUsd"
+  /** The halt day the daily-loss alert was last sent for (alerts are idempotent across restarts). */
+  | "dailyLossAlertedDay"
+  /** { at, streak } when the current loss-streak pause started (inactive -> active); extensions keep it. */
+  | "lossPauseStart"
+  /** The `at` of the pause the loss-streak alert was last sent for. */
+  | "lossPauseAlertedAt";
+
+export function perModeKey(base: PerModeKeyBase, mode: string): string {
   return `${base}:${mode}`;
 }
 
@@ -55,14 +68,20 @@ export interface EntryBlockerState {
 export interface EntryBlockerConfig {
   maxConsecutiveErrors: number;
   maxConcurrent: number;
+  /**
+   * PAPER_HALTS_OBSERVE_ONLY in paper mode: the daily-loss halt and the loss-streak
+   * pause are still computed and stored, but don't block. Kill switch, pause, error
+   * halt and slots are unaffected. Never set in live mode (startup refuses).
+   */
+  observeHalts?: boolean;
 }
 
 /** SPEC.md section 9.1, checked before every entry. First blocker wins. */
 export function checkEntryBlockers(state: EntryBlockerState, now: number, cfg: EntryBlockerConfig): EntryBlockerReason | null {
   if (state.killed) return "kill_switch";
   if (state.paused) return "paused";
-  if (state.dailyLossHaltDay !== null) return "daily_loss_halt";
-  if (state.pauseUntil !== null && now < state.pauseUntil) return "loss_streak_pause";
+  if (!cfg.observeHalts && state.dailyLossHaltDay !== null) return "daily_loss_halt";
+  if (!cfg.observeHalts && state.pauseUntil !== null && now < state.pauseUntil) return "loss_streak_pause";
   if (state.consecutiveErrors >= cfg.maxConsecutiveErrors) return "error_halt";
   if (state.openPositionsCount >= cfg.maxConcurrent) return "slots_full";
   return null;

@@ -43,17 +43,10 @@ import {
   buildStartupMessage,
   buildStuckSellMessage,
 } from "./notify/urgent.js";
-import { computeTotals, formatReport, type TradeRecord } from "./report/index.js";
-import {
-  checkEntryBlockers,
-  checkKillSwitch,
-  perModeKey,
-  realizedNetPnlForDay,
-  applyTradeToLossStreak,
-  unrealizedLossForMode,
-  updateDailyLossHalt,
-  type EntryBlockerState,
-} from "./risk/index.js";
+import { computeTotals, formatReport, formatWouldBlockCounts, type ReplayableTradeRecord } from "./report/index.js";
+import { replayAsIfLive, type ReplayConfig } from "./report/asIfLive.js";
+import { checkKillSwitch, perModeKey, realizedNetPnlForDay, unrealizedLossForMode } from "./risk/index.js";
+import { activeHalts, entryBlockerReason, evaluateHalts, readHalts, recordTradeForStreak, wouldBlockTag, type HaltConfig, type HaltEffects } from "./risk/halts.js";
 import { LaneLimiter } from "./limiters/laneLimiter.js";
 import { IntentsStore } from "./storage/intents.js";
 import { FeeLossesStore } from "./storage/feeLosses.js";
@@ -83,7 +76,7 @@ import { paperEntryFill, paperExitFill, shouldWriteOff } from "./executor/paper.
 import { shadowEntry, shadowStep, shadowValue } from "./tracking/shadows.js";
 import { dueOffsetMinutes as skipDueOffset, isSkipTrackResolved } from "./tracking/skipTracking.js";
 import { dueOffsetMinutes as postExitDueOffset, isPostExitTrackResolved } from "./tracking/postExit.js";
-import { tradingDayKey } from "./time.js";
+import { formatClockInZone, tradingDayKey } from "./time.js";
 import { VirtualWallet } from "./wallet/index.js";
 import type { DexPair } from "./types.js";
 
@@ -540,8 +533,8 @@ async function main(): Promise<void> {
 
   if (live) {
     logger.info("Live mode: wallet loaded", { address: live.address, sellFeeReserveSol: config.sellFeeReserveSol });
-    // Section 16.8: the paper go-live checklist informs, never blocks.
-    const checklist = goLiveChecklist(tradeRowsToRecords("paper"), false, {
+    // Section 16.8: the paper go-live checklist informs, never blocks. Section 11.4: it uses the "as if live" paper trades.
+    const checklist = goLiveChecklist(replayAsIfLive(tradeRowsToRecords("paper"), asIfLiveCfg()).kept, false, {
       minTrades: config.GOLIVE_MIN_TRADES,
       minDays: config.GOLIVE_MIN_DAYS,
       minMedianPnlPct: config.GOLIVE_MIN_MEDIAN_PNL_PCT,
@@ -690,26 +683,45 @@ async function main(): Promise<void> {
     });
   }
 
+  // ---- Halts (section 9.1): daily-loss halt and loss-streak pause, their alerts (section 10) and observe mode ----
+  const haltCfg: HaltConfig = {
+    mode: config.MODE,
+    tradingDayTz: config.TRADING_DAY_TZ,
+    maxDailyLossUsd: config.MAX_DAILY_LOSS_USD,
+    consecutiveLossPause: config.CONSECUTIVE_LOSS_PAUSE,
+    lossPauseMinutes: config.LOSS_PAUSE_MINUTES,
+    observeOnly: config.MODE === "paper" && config.PAPER_HALTS_OBSERVE_ONLY,
+    urgentAlerts: config.URGENT_ALERTS,
+  };
+  const haltFx: HaltEffects = {
+    send: (text) => void telegram.sendMessage(text),
+    logEvent: (type, message, meta) => {
+      logger.warn(message, { type });
+      logEvent(db, Date.now(), type, message, meta);
+    },
+  };
+  function haltInputs(now: number) {
+    return { now, realizedNetPnlToday: realizedNetPnlToday(now), unrealizedLossSum: unrealizedLossSum() };
+  }
+  /** Recomputes the halts and sends any alert not yet sent (after trades, polls and at startup, not only on entry checks). */
+  function evaluateHaltsNow(): void {
+    evaluateHalts(stateStore, haltCfg, haltInputs(Date.now()), haltFx);
+  }
+
+  // Startup (after live reconciliation above): an alert for a halt or pause recorded before the bot
+  // stopped is sent now, and one already sent is never sent twice (both keyed on stored state).
+  evaluateHaltsNow();
+
   function entryBlocked(): string | null {
     const now = Date.now();
-    const haltDay = updateDailyLossHalt(
-      stateStore.get<string | null>(DAILY_LOSS_HALT_DAY_KEY, null),
-      realizedNetPnlToday(now),
-      unrealizedLossSum(),
-      now,
-      { maxDailyLossUsd: config.MAX_DAILY_LOSS_USD, tradingDayTz: config.TRADING_DAY_TZ },
-    );
-    stateStore.set(DAILY_LOSS_HALT_DAY_KEY, haltDay);
-
-    const blockerState: EntryBlockerState = {
+    const reason = entryBlockerReason(stateStore, haltCfg, haltInputs(now), haltFx, {
       killed: fs.existsSync(KILL_PATH) || stateStore.get<boolean>(KILLED_VIA_COMMAND_KEY, false),
       paused: stateStore.get<boolean>(PAUSED_KEY, false),
-      dailyLossHaltDay: haltDay,
-      pauseUntil: stateStore.get<number | null>(LOSS_PAUSE_UNTIL_KEY, null),
       consecutiveErrors: stateStore.get<number>(CONSECUTIVE_ERRORS_KEY, 0),
       openPositionsCount: positionsStore.listOpen().length,
-    };
-    const reason = checkEntryBlockers(blockerState, now, { maxConsecutiveErrors: config.MAX_CONSECUTIVE_ERRORS, maxConcurrent: config.MAX_CONCURRENT });
+      maxConsecutiveErrors: config.MAX_CONSECUTIVE_ERRORS,
+      maxConcurrent: config.MAX_CONCURRENT,
+    });
     if (reason === "slots_full") funnel.skippedSlotsFull++;
     return reason;
   }
@@ -1010,6 +1022,7 @@ async function main(): Promise<void> {
       sellabilityLossPct: fill.sellability?.roundTripLossPct ?? null,
       sellabilityCheckedAt: fill.sellability?.checkedAt ?? null,
       dexId: snap?.pair.dexId ?? null,
+      wouldBlockAtEntry: wouldBlockTag(activeHalts(readHalts(stateStore, config.MODE), now, config.TRADING_DAY_TZ)),
       ...(fill.live ?? {}),
     });
     if (state.history.length > 0) positionsStore.appendHistory(id, state.history[0]!);
@@ -1203,14 +1216,8 @@ async function main(): Promise<void> {
     positionsStore.remove(row.id);
     lastValueUsdByPosition.delete(row.id);
 
-    const streak = applyTradeToLossStreak(
-      { consecutiveLosses: stateStore.get<number>(LOSS_STREAK_KEY, 0), pauseUntil: stateStore.get<number | null>(LOSS_PAUSE_UNTIL_KEY, null) },
-      { netPnlUsd, proceedsUnknown: extras.proceedsUnknown ?? false },
-      now,
-      { consecutiveLossPause: config.CONSECUTIVE_LOSS_PAUSE, lossPauseMinutes: config.LOSS_PAUSE_MINUTES },
-    );
-    stateStore.set(LOSS_STREAK_KEY, streak.consecutiveLosses);
-    stateStore.set(LOSS_PAUSE_UNTIL_KEY, streak.pauseUntil);
+    recordTradeForStreak(stateStore, haltCfg, { netPnlUsd, proceedsUnknown: extras.proceedsUnknown ?? false }, now);
+    evaluateHaltsNow(); // section 9.1/10: a new halt or pause alerts now, not at the next entry check
 
     if (config.POST_EXIT_TRACK) {
       postExitTracksStore.insert({ tradeId, mint: row.mint, exitTime: now, exitPriceUsd: entrySnapshot ? Number(entrySnapshot.priceUsd ?? "0") : null });
@@ -1249,6 +1256,7 @@ async function main(): Promise<void> {
   void runLoop("monitor", config.jupiter.effectivePollSeconds * 1000, logger, signal, async () => {
     await pollOpenPositionsTick();
     await pollClosingPositionsTick();
+    evaluateHaltsNow();
   });
 
   // ---- Liquidity batch (section 8.1) ----
@@ -1375,10 +1383,20 @@ async function main(): Promise<void> {
   });
 
   // ---- Report (section 11.4), shared by npm run report and /report ----
-  function tradeRowsToRecords(mode?: "paper" | "live", from?: string, to?: string): TradeRecord[] {
+  /** Section 11.4: the halt limits the "as if live" replay applies (the current config). */
+  function asIfLiveCfg(): ReplayConfig {
+    return {
+      maxDailyLossUsd: config.MAX_DAILY_LOSS_USD,
+      consecutiveLossPause: config.CONSECUTIVE_LOSS_PAUSE,
+      lossPauseMinutes: config.LOSS_PAUSE_MINUTES,
+      tradingDayTz: config.TRADING_DAY_TZ,
+    };
+  }
+
+  function tradeRowsToRecords(mode?: "paper" | "live", from?: string, to?: string): ReplayableTradeRecord[] {
     return tradesStore.listAll({ ...(mode ? { mode } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}) }).map((t) => {
       const snapshot = t.entryPairSnapshot as DexPair | null;
-      const components = t.scoreComponents as TradeRecord["scoreComponents"];
+      const components = t.scoreComponents as ReplayableTradeRecord["scoreComponents"];
       return {
         mode: t.mode as "paper" | "live",
         exitTime: t.exitTime,
@@ -1395,6 +1413,8 @@ async function main(): Promise<void> {
         score: t.score,
         scoreComponents: components,
         proceedsUnknown: t.proceedsUnknown,
+        entryTime: t.entryTime,
+        wouldBlockAtEntry: t.wouldBlockAtEntry,
       };
     });
   }
@@ -1409,6 +1429,9 @@ async function main(): Promise<void> {
       trades: tradeRowsToRecords(mode, opts.from, opts.to),
       ...(mode === "live" ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) } : {}),
       paperTrades: tradeRowsToRecords("paper"),
+      ...(mode === "paper"
+        ? { asIfLive: { cfg: asIfLiveCfg(), allPaperTrades: tradeRowsToRecords("paper"), ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) } }
+        : {}),
       skipTracks: skipTracksStore.listAll().map((r) => ({ skipReason: r.skipReason, priceAtSkipUsd: r.priceAtSkipUsd, price15mUsd: r.price15mUsd, price60mUsd: r.price60mUsd })),
       hasStuckPositions: hasStuck,
       goLiveConfig: {
@@ -1486,6 +1509,14 @@ async function main(): Promise<void> {
       dailyLossHalted: stateStore.get<string | null>(DAILY_LOSS_HALT_DAY_KEY, null) !== null,
       errorHalted: stateStore.get<number>(CONSECUTIVE_ERRORS_KEY, 0) >= config.MAX_CONSECUTIVE_ERRORS,
       lossStreak: stateStore.get<number>(LOSS_STREAK_KEY, 0),
+      lossPauseUntil: (() => {
+        const until = stateStore.get<number | null>(LOSS_PAUSE_UNTIL_KEY, null);
+        return until !== null && now < until ? formatClockInZone(until, config.TRADING_DAY_TZ) : null;
+      })(),
+      haltsObserveOnly: haltCfg.observeOnly,
+      ...(config.MODE === "paper"
+        ? { wouldBeHaltEntriesToday: formatWouldBlockCounts([...todaysAll, ...positionsStore.listAllActive().filter((p) => p.mode === config.MODE)]) }
+        : {}),
       solPriceUsd: solPriceTracker.get().priceUsd,
       walletUsdc: executor.walletBalances().usdc,
       walletSol: executor.walletBalances().sol,

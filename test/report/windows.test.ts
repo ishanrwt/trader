@@ -205,3 +205,25 @@ describe("npm run report -- --windows (CLI)", () => {
     }
   });
 });
+
+describe("windows: trades taken under a would-be halt (section 11.4)", () => {
+  it("counts tagged trades per window and in the day total; 'none' and unrecorded tags don't count", () => {
+    const trades: WindowTrade[] = [
+      { ...t(ist("16:10"), -1), wouldBlockAtEntry: "loss_streak" },
+      { ...t(ist("16:20"), -1), wouldBlockAtEntry: "daily_loss+loss_streak" },
+      { ...t(ist("16:30"), 2), wouldBlockAtEntry: "none" },
+      { ...t(ist("18:10"), 1), wouldBlockAtEntry: null },
+    ];
+    const text = formatWindowStats("paper", windowStats(trades, [], { ...OPTS, now: ist("19:00") }));
+    expect(text).toContain("  16:00-18:00: 3 trades, 1 win, net $0.00, 2 under would-be halt");
+    expect(text).toContain("  18:00-20:00 (current): 1 trade, 1 win, net +$1.00\n");
+    expect(text).toContain("  day total: 4 trades, 2 wins, net +$1.00, 2 under would-be halt");
+  });
+
+  it("buildWindowsReport reads the tag from the stored trades", () => {
+    const db = openDb(":memory:");
+    insertTrade(db, ist("10:05"), -1, { wouldBlockAtEntry: "loss_streak" });
+    insertTrade(db, ist("10:15"), 1, { wouldBlockAtEntry: "none" });
+    expect(buildWindowsReport(db, { mode: "paper", ...OPTS, now: ist("11:00") })).toContain("  10:00-12:00 (current): 2 trades, 1 win, net $0.00, 1 under would-be halt");
+  });
+});

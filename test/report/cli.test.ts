@@ -73,7 +73,7 @@ describe("report CLI entry point (src/report/cli.ts), not just the report functi
       });
 
       expect(output).toContain("=== Report (1 trades) ===");
-      expect(output).toContain("Go-live checklist:");
+      expect(output).toContain("Go-live checklist (as if live):"); // paper: the checklist uses the as-if-live view (section 11.4)
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

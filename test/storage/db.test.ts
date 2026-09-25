@@ -26,7 +26,7 @@ describe("openDb / runMigrations", () => {
 
   it("sets PRAGMA user_version to the latest migration number", () => {
     const db = openDb(":memory:");
-    expect(db.pragma("user_version", { simple: true })).toBe(5);
+    expect(db.pragma("user_version", { simple: true })).toBe(6);
     db.close();
   });
 
@@ -34,7 +34,7 @@ describe("openDb / runMigrations", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     expect(() => runMigrations(db)).not.toThrow();
-    expect(db.pragma("user_version", { simple: true })).toBe(5);
+    expect(db.pragma("user_version", { simple: true })).toBe(6);
     db.close();
   });
 

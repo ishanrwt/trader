@@ -119,6 +119,9 @@ export const envSchema = z.object({
   PAPER_EXTRA_SLIPPAGE_PCT: numberField(2),
   PAPER_LATENCY_SEC: numberField(3),
   PAPER_FEE_USD_PER_TX: numberField(0.05),
+  // Section 9.1: paper only. The daily-loss halt and loss-streak pause are computed, stored and
+  // alerted but don't block entries. MODE=live refuses to start with this on.
+  PAPER_HALTS_OBSERVE_ONLY: boolField(false),
 
   // ---- Tracking ----
   SHADOW_ENABLED: boolField(true),

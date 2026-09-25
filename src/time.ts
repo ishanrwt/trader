@@ -18,6 +18,24 @@ export function tradingDayKey(ms: number, timeZone: string): string {
   return formatter.format(new Date(ms));
 }
 
+/**
+ * "21:44 IST": wall-clock HH:MM in `timeZone` plus its short name. en-US gives
+ * names like EDT or UTC; where it only has a raw offset (GMT+5:30), en-IN is
+ * tried for a named abbreviation (IST), else the offset is kept.
+ */
+export function formatClockInZone(ms: number, timeZone: string): string {
+  const parts = (locale: string) =>
+    new Intl.DateTimeFormat(locale, { timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" }).formatToParts(new Date(ms));
+  const us = parts("en-US");
+  const pick = (ps: Intl.DateTimeFormatPart[], type: string) => ps.find((p) => p.type === type)?.value ?? "";
+  let zone = pick(us, "timeZoneName");
+  if (zone.startsWith("GMT")) {
+    const alt = pick(parts("en-IN"), "timeZoneName");
+    if (alt && !alt.startsWith("GMT")) zone = alt;
+  }
+  return `${pick(us, "hour")}:${pick(us, "minute")} ${zone}`;
+}
+
 /** True if `a` and `b` fall on the same trading day in `timeZone`. */
 export function isSameTradingDay(a: number, b: number, timeZone: string): boolean {
   return tradingDayKey(a, timeZone) === tradingDayKey(b, timeZone);

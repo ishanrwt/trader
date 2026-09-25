@@ -60,6 +60,14 @@ describe("tradeFromPosition (the trade row finalizeTrade records)", () => {
     expect(trade.netPnlUsd).toBeCloseTo(20.8 - 25.05, 10);
   });
 
+  it("carries the would-be-halt tag from the position to the trade (section 11.1); unset stays null (not recorded)", () => {
+    expect(finalize({ wouldBlockAtEntry: "daily_loss+loss_streak" }).trade.wouldBlockAtEntry).toBe("daily_loss+loss_streak");
+    expect(finalize({ wouldBlockAtEntry: "none" }).trade.wouldBlockAtEntry).toBe("none");
+    const untagged = finalize({});
+    expect(untagged.row.wouldBlockAtEntry).toBeNull();
+    expect(untagged.trade.wouldBlockAtEntry).toBeNull();
+  });
+
   it("a non-stop close carries null stop values", () => {
     const { trade } = finalize({}, 32, "target");
     expect(trade.stopPollPnlPct).toBeNull();

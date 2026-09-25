@@ -41,6 +41,19 @@ describe("loadConfig: live interlocks (SPEC.md section 16.8)", () => {
     expect(JSON.stringify(config)).not.toContain(key.base58);
   });
 
+  it("refuses to start with PAPER_HALTS_OBSERVE_ONLY=true (section 9.1: live halts always block)", () => {
+    expect(issuesOf(() => loadConfig(liveEnv({ PAPER_HALTS_OBSERVE_ONLY: "true" })))).toMatch(
+      /PAPER_HALTS_OBSERVE_ONLY=true is paper-only: MODE=live refuses to start with it on/,
+    );
+    expect(loadConfig(liveEnv({ PAPER_HALTS_OBSERVE_ONLY: "false" })).MODE).toBe("live");
+  });
+
+  it("PAPER_HALTS_OBSERVE_ONLY=true is accepted in paper mode, and defaults to false", () => {
+    const paper = { MODE: "paper", LIVE_ACK: "", WALLET_PRIVATE_KEY: "" };
+    expect(loadConfig(liveEnv({ ...paper, PAPER_HALTS_OBSERVE_ONLY: "true" })).PAPER_HALTS_OBSERVE_ONLY).toBe(true);
+    expect(loadConfig(liveEnv(paper)).PAPER_HALTS_OBSERVE_ONLY).toBe(false);
+  });
+
   it("refuses without LIVE_ACK exactly I_ACCEPT_REAL_LOSSES", () => {
     expect(issuesOf(() => loadConfig(liveEnv({ LIVE_ACK: "" })))).toMatch(/LIVE_ACK=I_ACCEPT_REAL_LOSSES/);
     expect(issuesOf(() => loadConfig(liveEnv({ LIVE_ACK: "i_accept_real_losses" })))).toMatch(/LIVE_ACK/);

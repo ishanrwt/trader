@@ -37,6 +37,12 @@ export interface DigestInput {
   dailyLossHalted: boolean;
   errorHalted: boolean;
   lossStreak: number;
+  /** Section 9.1: the loss-streak pause end as wall-clock text ("21:44 IST") while it's active, else null. */
+  lossPauseUntil?: string | null;
+  /** PAPER_HALTS_OBSERVE_ONLY: halts are shown but labelled as not blocking. */
+  haltsObserveOnly?: boolean;
+  /** Paper only (section 10): today's trades and open positions taken under a would-be halt, e.g. "3 (daily_loss 1, loss_streak 2, both 0)". */
+  wouldBeHaltEntriesToday?: string;
   solPriceUsd: number | null;
   walletUsdc: number;
   walletSol: number;
@@ -161,6 +167,7 @@ export function buildDigest(input: DigestInput): string {
   const exitBreakdown = Object.entries(input.tradingDay.exitReasonBreakdown);
   lines.push(`  exit reasons: ${exitBreakdown.length > 0 ? exitBreakdown.map(([r, c]) => `${r}=${c}`).join(", ") : "none"}`);
   if (input.live) lines.push(`  fee losses from failed transactions: ${input.live.feeLossesToday.count}, ${fmtUsd(-input.live.feeLossesToday.usd)}`);
+  if (input.wouldBeHaltEntriesToday !== undefined) lines.push(`  taken under a would-be halt: ${input.wouldBeHaltEntriesToday}`);
   lines.push("");
 
   lines.push("Funnel:");
@@ -179,10 +186,12 @@ export function buildDigest(input: DigestInput): string {
   lines.push("Risk:");
   lines.push(`  paused: ${input.paused}${input.pauseReason ? ` (${input.pauseReason})` : ""}`);
   lines.push(`  killed: ${input.killed}`);
-  lines.push(`  daily loss halt: ${input.dailyLossHalted}`);
+  const observing = input.haltsObserveOnly ? " (observing only, not blocking)" : "";
+  lines.push(`  daily loss halt: ${input.dailyLossHalted}${input.dailyLossHalted ? observing : ""}`);
   lines.push(`  error halt: ${input.errorHalted}`);
   lines.push(`  daily loss: ${fmtUsd(-Math.abs(input.risk.dailyLossUsd))} vs -$${input.risk.dailyLossCapUsd.toFixed(2)} cap`);
   lines.push(`  loss streak: ${input.lossStreak}`);
+  if (input.lossPauseUntil !== undefined) lines.push(`  loss-streak pause: ${input.lossPauseUntil === null ? "none" : `until ${input.lossPauseUntil}${observing}`}`);
   lines.push("");
 
   lines.push("Health:");

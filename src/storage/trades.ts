@@ -153,6 +153,7 @@ interface TradeRowDb {
   dex_id: string | null;
   stop_poll_pnl_pct: number | null;
   stop_confirm_pnl_pct: number | null;
+  would_block_at_entry: string | null;
 }
 
 function fromDb(row: TradeRowDb): TradeRow {
@@ -182,6 +183,7 @@ function fromDb(row: TradeRowDb): TradeRow {
     dexId: row.dex_id,
     stopPollPnlPct: row.stop_poll_pnl_pct,
     stopConfirmPnlPct: row.stop_confirm_pnl_pct,
+    wouldBlockAtEntry: row.would_block_at_entry,
     id: row.id,
     mode: row.mode,
     mint: row.mint,
@@ -264,7 +266,7 @@ export class TradesStore {
           entry_fee_lamports, exit_fee_lamports, entry_fee_usd, exit_fee_usd, rent_paid_lamports, rent_reclaimed_lamports,
           rent_paid_usd, rent_reclaimed_usd, entry_sol_price_usd, exit_sol_price_usd, sell_attempts,
           failed_sell_fees_lamports, failed_sell_fees_usd, proceeds_unknown,
-          sellability_loss_pct, sellability_checked_at, dex_id, stop_poll_pnl_pct, stop_confirm_pnl_pct
+          sellability_loss_pct, sellability_checked_at, dex_id, stop_poll_pnl_pct, stop_confirm_pnl_pct, would_block_at_entry
         ) VALUES (@mode, @mint, @symbol, @pair_address, @entry_time, @exit_time, @size_usd, @cost_basis, @proceeds,
           @net_pnl_usd, @net_pnl_pct, @exit_reason, @peak_pnl, @timer_restarts, @target_extensions, @fees_usd,
           @entry_pair_snapshot, @top1_pct, @top10_pct, @score, @score_components, @animal_flag, @trading_day,
@@ -274,7 +276,7 @@ export class TradesStore {
           @entry_fee_lamports, @exit_fee_lamports, @entry_fee_usd, @exit_fee_usd, @rent_paid_lamports, @rent_reclaimed_lamports,
           @rent_paid_usd, @rent_reclaimed_usd, @entry_sol_price_usd, @exit_sol_price_usd, @sell_attempts,
           @failed_sell_fees_lamports, @failed_sell_fees_usd, @proceeds_unknown,
-          @sellability_loss_pct, @sellability_checked_at, @dex_id, @stop_poll_pnl_pct, @stop_confirm_pnl_pct)`,
+          @sellability_loss_pct, @sellability_checked_at, @dex_id, @stop_poll_pnl_pct, @stop_confirm_pnl_pct, @would_block_at_entry)`,
       )
       .run({
         ...tradeLiveToDb({ ...TRADE_LIVE_DEFAULTS, ...definedOnly(row) }),
@@ -283,6 +285,7 @@ export class TradesStore {
         dex_id: row.dexId ?? DEFAULT_DETAIL_FIELDS.dexId,
         stop_poll_pnl_pct: row.stopPollPnlPct ?? DEFAULT_DETAIL_FIELDS.stopPollPnlPct,
         stop_confirm_pnl_pct: row.stopConfirmPnlPct ?? DEFAULT_DETAIL_FIELDS.stopConfirmPnlPct,
+        would_block_at_entry: row.wouldBlockAtEntry ?? DEFAULT_DETAIL_FIELDS.wouldBlockAtEntry,
         mode: row.mode,
         mint: row.mint,
         symbol: row.symbol,

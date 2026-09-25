@@ -1,5 +1,6 @@
 import { equalSizeBuckets, maxDrawdown, mean, median, pearsonCorrelation, percentile } from "./stats.js";
 import type { TradeRow } from "../storage/trades.js";
+import { replayAsIfLive, type ReplayConfig } from "./asIfLive.js";
 
 export interface TradeRecord {
   mode: "paper" | "live";
@@ -18,6 +19,22 @@ export interface TradeRecord {
   scoreComponents: { buyPressure: number; activity: number; momentum: number; depth: number; holders: number; freshness: number } | null;
   /** A `reconciled` close whose proceeds are unknown (section 16.5): shown separately; excluded from win rate, median, mean and percentiles. */
   proceedsUnknown?: boolean;
+  /** Needed by the as-if-live replay (section 11.4). */
+  entryTime?: number;
+  /** Section 11.1: halts a live bot would have been blocked by at entry; null/undefined = not recorded. */
+  wouldBlockAtEntry?: string | null;
+}
+
+/** A paper trade the as-if-live replay can place in entry order. */
+export type ReplayableTradeRecord = TradeRecord & { entryTime: number };
+
+/** Section 11.4: paper-only "as if live" view, replayed over the whole paper history (the streak carries across periods). */
+export interface AsIfLiveInput {
+  cfg: ReplayConfig;
+  allPaperTrades: readonly ReplayableTradeRecord[];
+  /** The report period, by trading day (inclusive); kept/dropped counts and totals cover only this period. */
+  from?: string;
+  to?: string;
 }
 
 /** Fees of failed live transactions (section 16.3): realized losses outside any trade. */
@@ -294,6 +311,8 @@ export function formatReport(input: {
   feeLosses?: readonly FeeLossRecord[];
   /** Section 11.4: a heading naming the mode when both modes are printed. */
   modeLabel?: string;
+  /** Paper only: adds the "as if live" block, and the go-live checklist uses it (section 11.4). */
+  asIfLive?: AsIfLiveInput;
 }): string {
   const totals = computeTotals(input.trades, input.feeLosses ?? []);
   const byReason = breakdownByExitReason(input.trades);
@@ -301,11 +320,16 @@ export function formatReport(input: {
   const scoreQuintiles = quantileBuckets(input.trades, (t) => t.score, 5);
   const correlations = scoreComponentCorrelations(input.trades.filter((t) => !t.proceedsUnknown));
   const skipStats = skipReasonStats(input.skipTracks);
-  const checklist = goLiveChecklist(input.paperTrades, input.hasStuckPositions, input.goLiveConfig);
+  const replay = input.asIfLive ? replayAsIfLive(input.asIfLive.allPaperTrades, input.asIfLive.cfg) : null;
+  const checklist = goLiveChecklist(replay ? replay.kept : input.paperTrades, input.hasStuckPositions, input.goLiveConfig);
 
   const lines: string[] = [];
   if (input.modeLabel) lines.push(`##### ${input.modeLabel} #####`);
   lines.push(`=== Report (${input.trades.length} trades) ===`);
+  if (input.asIfLive) {
+    lines.push("View: all trades (everything paper took; see \"As if live\" below)");
+    lines.push(`Taken under a would-be halt (tagged at entry): ${formatWouldBlockCounts(input.trades)}`);
+  }
   if (input.modeLabel && input.trades.length === 0) lines.push(`No ${input.modeLabel.toLowerCase()} trades in this period.`);
   lines.push(
     `Win rate ${(totals.winRate * 100).toFixed(1)}%, median ${totals.medianNetPnlPct.toFixed(1)}%, total $${totals.totalNetPnlUsd.toFixed(2)}, max drawdown $${totals.maxDrawdownUsd.toFixed(2)}`,
@@ -334,9 +358,64 @@ export function formatReport(input: {
   lines.push(
     `Skip reasons: ${skipStats.map((s) => `${s.reason}(n=${s.count}, +15m=${fmtSkipPct(s.median15mPctChange)}, +60m=${fmtSkipPct(s.median60mPctChange)})`).join(", ") || "none"}`,
   );
-  lines.push("Go-live checklist:");
+  if (input.asIfLive && replay) lines.push(...formatAsIfLive(input.asIfLive, replay));
+  lines.push(input.asIfLive ? "Go-live checklist (as if live):" : "Go-live checklist:");
   for (const item of checklist) lines.push(`  [${item.pass ? "PASS" : "FAIL"}] ${item.check} (${item.detail})`);
   return lines.join("\n");
+}
+
+/** "3 (daily_loss 1, loss_streak 2, both 0); not recorded 14", from the per-trade tags (section 11.1). */
+export function formatWouldBlockCounts(trades: ReadonlyArray<{ wouldBlockAtEntry?: string | null }>): string {
+  let dailyLoss = 0;
+  let lossStreak = 0;
+  let both = 0;
+  let notRecorded = 0;
+  for (const t of trades) {
+    const tag = t.wouldBlockAtEntry ?? null;
+    if (tag === null) notRecorded++;
+    else if (tag === "daily_loss") dailyLoss++;
+    else if (tag === "loss_streak") lossStreak++;
+    else if (tag === "daily_loss+loss_streak") both++;
+  }
+  const total = dailyLoss + lossStreak + both;
+  return `${total} (daily_loss ${dailyLoss}, loss_streak ${lossStreak}, both ${both})${notRecorded > 0 ? `; not recorded ${notRecorded}` : ""}`;
+}
+
+function inPeriod(day: string, from?: string, to?: string): boolean {
+  return (from === undefined || day >= from) && (to === undefined || day <= to);
+}
+
+function formatAsIfLive(input: AsIfLiveInput, replay: ReturnType<typeof replayAsIfLive<ReplayableTradeRecord>>): string[] {
+  const kept = replay.kept.filter((t) => inPeriod(t.tradingDay, input.from, input.to));
+  const dropped = replay.dropped.filter((d) => inPeriod(d.trade.tradingDay, input.from, input.to));
+  let dailyLoss = 0;
+  let lossStreak = 0;
+  let both = 0;
+  for (const d of dropped) {
+    if (d.reasons.length === 2) both++;
+    else if (d.reasons[0] === "daily_loss") dailyLoss++;
+    else lossStreak++;
+  }
+  const totals = computeTotals(kept);
+  const byDay = breakdownByTradingDay(kept);
+  const lines = [
+    "--- As if live (section 9.1 halts replayed over paper trades) ---",
+    `Limits used (current .env): MAX_DAILY_LOSS_USD=${input.cfg.maxDailyLossUsd}, CONSECUTIVE_LOSS_PAUSE=${input.cfg.consecutiveLossPause}, LOSS_PAUSE_MINUTES=${input.cfg.lossPauseMinutes}`,
+    `Kept ${kept.length} of ${kept.length + dropped.length}; dropped ${dropped.length} (daily_loss ${dailyLoss}, loss_streak ${lossStreak}, both ${both})`,
+    `Win rate ${(totals.winRate * 100).toFixed(1)}%, median ${totals.medianNetPnlPct.toFixed(1)}%, total $${totals.totalNetPnlUsd.toFixed(2)}, max drawdown $${totals.maxDrawdownUsd.toFixed(2)}`,
+    "By trading day:",
+  ];
+  const days = Object.keys(byDay).sort();
+  if (days.length === 0) lines.push("  none");
+  for (const day of days) {
+    const d = byDay[day]!;
+    lines.push(`  ${day}: ${d.trades} trades, win rate ${(d.winRate * 100).toFixed(1)}%, total $${d.totalNetPnlUsd.toFixed(2)}`);
+  }
+  lines.push(
+    "Approximations: only realized PnL is replayed (live also counts unrealized losses, so it can halt earlier); slot usage differs " +
+      "(a dropped trade may have freed a slot for a candidate paper never took); the limits above are applied to all history.",
+  );
+  return lines;
 }
 
 /** SPEC.md section 11.4: go-live checklist, paper trades only. */

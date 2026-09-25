@@ -157,3 +157,26 @@ describe("buildDigest", () => {
     );
   });
 });
+
+describe("buildDigest: halts and PAPER_HALTS_OBSERVE_ONLY (sections 9.1 and 10)", () => {
+  it("shows the active loss-streak pause and today's entries taken under a would-be halt, labelled as observing only", () => {
+    const text = buildDigest(
+      baseInput({
+        dailyLossHalted: true,
+        lossStreak: 11,
+        lossPauseUntil: "21:44 IST",
+        haltsObserveOnly: true,
+        wouldBeHaltEntriesToday: "3 (daily_loss 0, loss_streak 3, both 0)",
+      }),
+    );
+    expect(text).toContain("  taken under a would-be halt: 3 (daily_loss 0, loss_streak 3, both 0)");
+    expect(text).toContain("  daily loss halt: true (observing only, not blocking)");
+    expect(text).toContain("  loss-streak pause: until 21:44 IST (observing only, not blocking)");
+  });
+
+  it("enforcing mode shows the pause without the observe label, and 'none' when no pause is active", () => {
+    expect(buildDigest(baseInput({ lossPauseUntil: "21:44 IST" }))).toContain("  loss-streak pause: until 21:44 IST\n");
+    expect(buildDigest(baseInput({ lossPauseUntil: null }))).toContain("  loss-streak pause: none");
+    expect(buildDigest(baseInput())).not.toContain("taken under a would-be halt");
+  });
+});
