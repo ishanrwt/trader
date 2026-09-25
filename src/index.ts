@@ -73,7 +73,8 @@ import { TradesStore } from "./storage/trades.js";
 import { tradeFromPosition } from "./storage/tradeFromPosition.js";
 import { TradeHistoryStore } from "./storage/tradeHistory.js";
 import { paperEntryFill, paperExitFill, shouldWriteOff } from "./executor/paper.js";
-import { shadowEntry, shadowStep, shadowValue } from "./tracking/shadows.js";
+import { shadowStep, shadowValue } from "./tracking/shadows.js";
+import { createShadowOnReady } from "./tracking/shadowCreation.js";
 import { dueOffsetMinutes as skipDueOffset, isSkipTrackResolved } from "./tracking/skipTracking.js";
 import { dueOffsetMinutes as postExitDueOffset, isPostExitTrackResolved } from "./tracking/postExit.js";
 import { formatClockInZone, tradingDayKey } from "./time.js";
@@ -397,48 +398,26 @@ async function main(): Promise<void> {
 
   let shadowsSkippedForCap = 0;
 
+  // Section 11.2: one shadow per mint and mode, at its first READY with room under SHADOW_MAX_OPEN.
   function onNewlyReady(mint: string, pair: DexPair): void {
-    if (!config.SHADOW_ENABLED) return;
-    if (shadowsStore.countOpen() >= config.SHADOW_MAX_OPEN) {
-      shadowsSkippedForCap++;
-      return;
-    }
-    const priceUsd = Number(pair.priceUsd ?? "0");
-    const liquidityUsd = pair.liquidity?.usd ?? 0;
-    if (priceUsd <= 0 || liquidityUsd <= 0) return;
-    const sizeUsd = computePositionSizeUsd(config.POSITION_USD, liquidityUsd, config.MAX_POSITION_PCT_OF_LIQ);
-    const shadowCfg = { poolFeePct: config.SHADOW_POOL_FEE_PCT, extraSlippagePct: config.PAPER_EXTRA_SLIPPAGE_PCT, feeUsdPerTx: config.PAPER_FEE_USD_PER_TX };
-    const entry = shadowEntry(sizeUsd, priceUsd, liquidityUsd, shadowCfg);
-    const now = Date.now();
-    shadowsStore.insert({
+    const result = createShadowOnReady(
+      shadowsStore,
+      {
+        enabled: config.SHADOW_ENABLED,
+        mode: config.MODE,
+        maxOpen: config.SHADOW_MAX_OPEN,
+        positionUsd: config.POSITION_USD,
+        maxPositionPctOfLiq: config.MAX_POSITION_PCT_OF_LIQ,
+        targetProfitPct: config.TARGET_PROFIT_PCT,
+        holdMinutes: config.HOLD_MINUTES,
+        cost: { poolFeePct: config.SHADOW_POOL_FEE_PCT, extraSlippagePct: config.PAPER_EXTRA_SLIPPAGE_PCT, feeUsdPerTx: config.PAPER_FEE_USD_PER_TX },
+      },
       mint,
-      symbol: pair.baseToken.symbol ?? null,
-      pairAddress: pair.pairAddress,
-      outcome: "open",
-      mode: config.MODE,
-      entryTime: now,
-      costBasis: entry.costBasis,
-      tokenAmount: entry.tokens,
-      entryLiquidityUsd: liquidityUsd,
-      entryPriceUsd: entry.entryPrice,
-      score: null,
-      scoreComponents: null,
-      peakPnl: 0,
-      currentTarget: config.TARGET_PROFIT_PCT,
-      targetExtensions: 0,
-      timerRestarts: 0,
-      lastRestartAt: null,
-      deadline: now + config.HOLD_MINUTES * 60_000,
-      trailArmed: false,
-      fastStreak: 0,
-      lowLiqStreak: 0,
-      noRouteSince: null,
-      exitTime: null,
-      exitReason: null,
-      proceeds: null,
-      netPnlUsd: null,
-      netPnlPct: null,
-    });
+      pair,
+      Date.now(),
+      () => shadowsSkippedForCap++,
+    );
+    if (result === "exists") logger.debug("Mint READY again; it already has its shadow", { mint });
   }
 
   const phase2GateDeps: Phase2GateDeps = {

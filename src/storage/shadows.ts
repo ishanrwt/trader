@@ -33,9 +33,11 @@ export interface ShadowRow {
   netPnlPct: number | null;
   /** The mode of the run that created this shadow (SPEC.md section 11.2); rows from before Phase 3 are paper. */
   mode?: string;
+  /** Set only on rows from before migration 0007 that duplicated an earlier shadow of the same mint and mode: the id of the one kept. */
+  duplicateOf?: number | null;
 }
 
-export type NewShadowRow = Omit<ShadowRow, "id">;
+export type NewShadowRow = Omit<ShadowRow, "id" | "duplicateOf">;
 export type ShadowPatch = Partial<Omit<ShadowRow, "id" | "mint" | "entryTime">>;
 
 interface ShadowRowDb {
@@ -67,6 +69,7 @@ interface ShadowRowDb {
   net_pnl_usd: number | null;
   net_pnl_pct: number | null;
   mode: string;
+  duplicate_of: number | null;
 }
 
 function fromDb(row: ShadowRowDb): ShadowRow {
@@ -99,15 +102,38 @@ function fromDb(row: ShadowRowDb): ShadowRow {
     netPnlUsd: row.net_pnl_usd,
     netPnlPct: row.net_pnl_pct,
     mode: row.mode,
+    duplicateOf: row.duplicate_of,
   };
 }
+
+/**
+ * Every read below except get(id) excludes rows marked duplicate_of (SPEC.md
+ * section 11.2), so no caller — the shadow poll, the cap, selection marking,
+ * or the report — can see a duplicate.
+ */
+const NOT_DUPLICATE = "duplicate_of IS NULL";
 
 /** DB access for `shadows` (SPEC.md section 11.2). */
 export class ShadowsStore {
   constructor(private readonly db: Db) {}
 
+  /** Inserts a shadow. Throws (SQLITE_CONSTRAINT) if this mint and mode already has one; production code uses insertIfAbsent. */
   insert(row: NewShadowRow): number {
-    const info = this.db
+    return Number(this.run(row, "").lastInsertRowid);
+  }
+
+  /**
+   * Inserts the mint's shadow for its mode unless it already has one, and
+   * returns the new id, or null if one existed. The unique index makes this
+   * safe even when two processes race (SPEC.md section 11.2).
+   */
+  insertIfAbsent(row: NewShadowRow): number | null {
+    const info = this.run(row, " ON CONFLICT (mint, mode) WHERE duplicate_of IS NULL DO NOTHING");
+    return info.changes === 1 ? Number(info.lastInsertRowid) : null;
+  }
+
+  private run(row: NewShadowRow, onConflict: string) {
+    return this.db
       .prepare(
         `INSERT INTO shadows (
           mint, symbol, pair_address, outcome, entry_time, cost_basis, token_amount, entry_liquidity_usd, entry_price_usd,
@@ -115,7 +141,7 @@ export class ShadowsStore {
           deadline, trail_armed, fast_streak, low_liq_streak, no_route_since, exit_time, exit_reason, proceeds, net_pnl_usd, net_pnl_pct, mode
         ) VALUES (@mint, @symbol, @pair_address, @outcome, @entry_time, @cost_basis, @token_amount, @entry_liquidity_usd, @entry_price_usd,
           @score, @score_components, @peak_pnl, @current_target, @target_extensions, @timer_restarts, @last_restart_at,
-          @deadline, @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @exit_time, @exit_reason, @proceeds, @net_pnl_usd, @net_pnl_pct, @mode)`,
+          @deadline, @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @exit_time, @exit_reason, @proceeds, @net_pnl_usd, @net_pnl_pct, @mode)${onConflict}`,
       )
       .run({
         mint: row.mint,
@@ -146,7 +172,6 @@ export class ShadowsStore {
         net_pnl_usd: row.netPnlUsd,
         net_pnl_pct: row.netPnlPct,
       });
-    return Number(info.lastInsertRowid);
   }
 
   get(id: number): ShadowRow | undefined {
@@ -154,24 +179,30 @@ export class ShadowsStore {
     return row ? fromDb(row) : undefined;
   }
 
+  /** The mint's one shadow for this mode, in any outcome (SPEC.md section 11.2). */
+  getForMint(mint: string, mode: string): ShadowRow | undefined {
+    const row = this.db.prepare(`SELECT * FROM shadows WHERE mint = ? AND mode = ? AND ${NOT_DUPLICATE}`).get(mint, mode) as ShadowRowDb | undefined;
+    return row ? fromDb(row) : undefined;
+  }
+
   getOpenByMint(mint: string): ShadowRow | undefined {
-    const row = this.db.prepare("SELECT * FROM shadows WHERE mint = ? AND outcome = 'open' ORDER BY entry_time DESC LIMIT 1").get(mint) as
+    const row = this.db.prepare(`SELECT * FROM shadows WHERE mint = ? AND outcome = 'open' AND ${NOT_DUPLICATE} ORDER BY entry_time DESC LIMIT 1`).get(mint) as
       | ShadowRowDb
       | undefined;
     return row ? fromDb(row) : undefined;
   }
 
   listOpen(): ShadowRow[] {
-    return (this.db.prepare("SELECT * FROM shadows WHERE outcome = 'open' ORDER BY entry_time ASC").all() as ShadowRowDb[]).map(fromDb);
+    return (this.db.prepare(`SELECT * FROM shadows WHERE outcome = 'open' AND ${NOT_DUPLICATE} ORDER BY entry_time ASC`).all() as ShadowRowDb[]).map(fromDb);
   }
 
   countOpen(): number {
-    const { c } = this.db.prepare("SELECT COUNT(*) as c FROM shadows WHERE outcome = 'open'").get() as { c: number };
+    const { c } = this.db.prepare(`SELECT COUNT(*) as c FROM shadows WHERE outcome = 'open' AND ${NOT_DUPLICATE}`).get() as { c: number };
     return c;
   }
 
   listAll(): ShadowRow[] {
-    return (this.db.prepare("SELECT * FROM shadows ORDER BY entry_time ASC").all() as ShadowRowDb[]).map(fromDb);
+    return (this.db.prepare(`SELECT * FROM shadows WHERE ${NOT_DUPLICATE} ORDER BY entry_time ASC`).all() as ShadowRowDb[]).map(fromDb);
   }
 
   update(id: number, patch: ShadowPatch): void {
