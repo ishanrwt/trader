@@ -7,6 +7,7 @@ import { TradesStore } from "../storage/trades.js";
 import { TradeHistoryStore } from "../storage/tradeHistory.js";
 import { SkipTracksStore } from "../storage/skipTracks.js";
 import { PositionsStore } from "../storage/positions.js";
+import { FeeLossesStore } from "../storage/feeLosses.js";
 import { shouldWriteOff } from "../executor/paper.js";
 import type { DexPair } from "../types.js";
 
@@ -85,6 +86,29 @@ function main(): void {
         exitQuoteInAmount: t.exitQuoteInAmount,
         exitQuoteOutAmount: t.exitQuoteOutAmount,
         history: tradeHistoryStore.listForTrade(t.id),
+        live: {
+          mode: t.mode,
+          entrySignature: t.entrySignature,
+          exitSignature: t.exitSignature,
+          entryUsdcRaw: t.entryUsdcRaw,
+          entryTokensRaw: t.entryTokensRaw,
+          exitTokensRaw: t.exitTokensRaw,
+          exitUsdcRaw: t.exitUsdcRaw,
+          entryFeeLamports: t.entryFeeLamports,
+          exitFeeLamports: t.exitFeeLamports,
+          entryFeeUsd: t.entryFeeUsd,
+          exitFeeUsd: t.exitFeeUsd,
+          rentPaidLamports: t.rentPaidLamports,
+          rentReclaimedLamports: t.rentReclaimedLamports,
+          rentPaidUsd: t.rentPaidUsd,
+          rentReclaimedUsd: t.rentReclaimedUsd,
+          entrySolPriceUsd: t.entrySolPriceUsd,
+          exitSolPriceUsd: t.exitSolPriceUsd,
+          sellAttempts: t.sellAttempts,
+          failedSellFeesLamports: t.failedSellFeesLamports,
+          failedSellFeesUsd: t.failedSellFeesUsd,
+          proceedsUnknown: t.proceedsUnknown,
+        },
       };
     });
     console.log(formatTradeDetail(detail));
@@ -110,15 +134,21 @@ function main(): void {
         top10Pct: t.top10Pct,
         score: t.score,
         scoreComponents: t.scoreComponents as TradeRecord["scoreComponents"],
+        proceedsUnknown: t.proceedsUnknown,
       };
     });
   }
+  const feeLossesStore = new FeeLossesStore(db);
 
-  const hasStuck = positionsStore.listClosing().some((r) => shouldWriteOff(r.closingSince ?? Date.now(), Date.now(), config.STUCK_WRITE_OFF_MIN));
+  const hasStuck = positionsStore
+    .listClosing()
+    .some((r) => r.stuckState !== null || (r.mode === "paper" && shouldWriteOff(r.closingSince ?? Date.now(), Date.now(), config.STUCK_WRITE_OFF_MIN)));
 
-  console.log(
+  // Section 11.4: paper and live are never mixed. Without --mode, every section is printed once per mode.
+  const modes: Array<"paper" | "live"> = opts.mode ? [opts.mode] : ["paper", "live"];
+  const sections = modes.map((mode) =>
     formatReport({
-      trades: toRecords(opts.mode, opts.from, opts.to),
+      trades: toRecords(mode, opts.from, opts.to),
       paperTrades: toRecords("paper"),
       skipTracks: skipTracksStore.listAll().map((r) => ({ skipReason: r.skipReason, priceAtSkipUsd: r.priceAtSkipUsd, price15mUsd: r.price15mUsd, price60mUsd: r.price60mUsd })),
       hasStuckPositions: hasStuck,
@@ -129,8 +159,13 @@ function main(): void {
         minTotalPnlUsd: config.GOLIVE_MIN_TOTAL_PNL_USD,
         minP10PnlPct: config.GOLIVE_MIN_P10_PNL_PCT,
       },
+      ...(mode === "live"
+        ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) }
+        : {}),
+      ...(opts.mode ? {} : { modeLabel: mode.toUpperCase() }),
     }),
   );
+  console.log(sections.join("\n\n"));
   db.close();
 }
 

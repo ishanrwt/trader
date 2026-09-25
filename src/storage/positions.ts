@@ -1,7 +1,58 @@
 import type { Db } from "./db.js";
 import type { ExitState, HistoryPoint } from "../monitor/stateMachine.js";
 
-export interface PositionRow {
+export type StuckState = "stuck" | "budget_exhausted";
+
+/**
+ * Live-mode fields (SPEC.md sections 11.1, 16.3, 16.6). Paper positions leave
+ * them at their defaults. Raw amounts are large-integer strings.
+ */
+export interface PositionLiveFields {
+  tokenProgram: string | null;
+  tokenAccount: string | null;
+  /** The token account's raw balance as last known from the chain (confirmed entry, then reconciliation). */
+  tokenAmountRaw: string | null;
+  entrySignature: string | null;
+  entryUsdcRaw: string | null;
+  entryFeeLamports: number | null;
+  entryRentLamports: number | null;
+  entrySolPriceUsd: number | null;
+  sellAttempts: number;
+  /** Failed sell attempts (simulation/verification refusal, no route, on-chain failure, expiry). */
+  sellFailures: number;
+  /** Network fees paid by this position's sell attempts (failed and landed), for the fee budget. */
+  sellFeesLamports: number;
+  failedSellFeesLamports: number;
+  /** Current sell fee budget; null = SELL_FEE_BUDGET_SOL. /sellretry raises it. */
+  sellBudgetLamports: number | null;
+  stuckState: StuckState | null;
+  stuckSince: number | null;
+  nextSellAt: number | null;
+  /** Whether full sells still append closeAccount (cleared after a close-only simulation failure). */
+  closeAta: boolean;
+}
+
+export const DEFAULT_LIVE_FIELDS: PositionLiveFields = {
+  tokenProgram: null,
+  tokenAccount: null,
+  tokenAmountRaw: null,
+  entrySignature: null,
+  entryUsdcRaw: null,
+  entryFeeLamports: null,
+  entryRentLamports: null,
+  entrySolPriceUsd: null,
+  sellAttempts: 0,
+  sellFailures: 0,
+  sellFeesLamports: 0,
+  failedSellFeesLamports: 0,
+  sellBudgetLamports: null,
+  stuckState: null,
+  stuckSince: null,
+  nextSellAt: null,
+  closeAta: true,
+};
+
+export interface PositionRow extends PositionLiveFields {
   id: number;
   mode: string;
   mint: string;
@@ -79,10 +130,44 @@ interface PositionRowDb {
   entry_valuation_pnl_pct: number | null;
   entry_quote_in_amount: string | null;
   entry_quote_out_amount: string | null;
+  token_program: string | null;
+  token_account: string | null;
+  token_amount_raw: string | null;
+  entry_signature: string | null;
+  entry_usdc_raw: string | null;
+  entry_fee_lamports: number | null;
+  entry_rent_lamports: number | null;
+  entry_sol_price_usd: number | null;
+  sell_attempts: number;
+  sell_failures: number;
+  sell_fees_lamports: number;
+  failed_sell_fees_lamports: number;
+  sell_budget_lamports: number | null;
+  stuck_state: string | null;
+  stuck_since: number | null;
+  next_sell_at: number | null;
+  close_ata: number;
 }
 
 function fromDb(row: PositionRowDb): PositionRow {
   return {
+    tokenProgram: row.token_program,
+    tokenAccount: row.token_account,
+    tokenAmountRaw: row.token_amount_raw,
+    entrySignature: row.entry_signature,
+    entryUsdcRaw: row.entry_usdc_raw,
+    entryFeeLamports: row.entry_fee_lamports,
+    entryRentLamports: row.entry_rent_lamports,
+    entrySolPriceUsd: row.entry_sol_price_usd,
+    sellAttempts: row.sell_attempts,
+    sellFailures: row.sell_failures,
+    sellFeesLamports: row.sell_fees_lamports,
+    failedSellFeesLamports: row.failed_sell_fees_lamports,
+    sellBudgetLamports: row.sell_budget_lamports,
+    stuckState: row.stuck_state as StuckState | null,
+    stuckSince: row.stuck_since,
+    nextSellAt: row.next_sell_at,
+    closeAta: row.close_ata === 1,
     id: row.id,
     mode: row.mode,
     mint: row.mint,
@@ -121,11 +206,20 @@ function fromDb(row: PositionRowDb): PositionRow {
   };
 }
 
-export type NewPositionRow = Omit<PositionRow, "id">;
+/** Live fields are optional on insert (paper positions omit them; they default per DEFAULT_LIVE_FIELDS). */
+export type NewPositionRow = Omit<PositionRow, "id" | keyof PositionLiveFields> & Partial<PositionLiveFields>;
 /** tokenDecimals/entryValuationPnlPct/entryQuote* are write-once at insert time, like mode/mint/entryTime — update() never touches them. */
 export type PositionPatch = Partial<
-  Omit<PositionRow, "id" | "mode" | "mint" | "entryTime" | "tokenDecimals" | "entryValuationPnlPct" | "entryQuoteInAmount" | "entryQuoteOutAmount">
+  Omit<
+    PositionRow,
+    "id" | "mode" | "mint" | "entryTime" | "tokenDecimals" | "entryValuationPnlPct" | "entryQuoteInAmount" | "entryQuoteOutAmount" | keyof PositionLiveFields
+  >
 >;
+
+/** Live sell/reconciliation bookkeeping (SPEC.md sections 16.5, 16.6). `tokenAmount` is included because reconciliation adopts the on-chain amount. */
+export type PositionLivePatch = Partial<Omit<PositionLiveFields, "entrySignature" | "entryUsdcRaw" | "entryFeeLamports" | "entryRentLamports" | "entrySolPriceUsd">> & {
+  tokenAmount?: number;
+};
 
 /** DB access for `positions` and `position_history` (SPEC.md section 12). */
 export class PositionsStore {
@@ -139,14 +233,21 @@ export class PositionsStore {
           entry_liquidity_usd, entry_pair_snapshot, score, score_components, safety_result, holders_result,
           peak_pnl, current_target, target_extensions, timer_restarts, last_restart_at, deadline,
           trail_armed, fast_streak, low_liq_streak, no_route_since, closing_since, pending_exit_reason, last_pnl_pct, last_value_usd, last_polled_at,
-          token_decimals, entry_valuation_pnl_pct, entry_quote_in_amount, entry_quote_out_amount
+          token_decimals, entry_valuation_pnl_pct, entry_quote_in_amount, entry_quote_out_amount,
+          token_program, token_account, token_amount_raw, entry_signature, entry_usdc_raw, entry_fee_lamports,
+          entry_rent_lamports, entry_sol_price_usd, sell_attempts, sell_failures, sell_fees_lamports,
+          failed_sell_fees_lamports, sell_budget_lamports, stuck_state, stuck_since, next_sell_at, close_ata
         ) VALUES (@mode, @mint, @symbol, @pair_address, @status, @entry_time, @size_usd, @token_amount, @cost_basis,
           @entry_liquidity_usd, @entry_pair_snapshot, @score, @score_components, @safety_result, @holders_result,
           @peak_pnl, @current_target, @target_extensions, @timer_restarts, @last_restart_at, @deadline,
           @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @closing_since, @pending_exit_reason, @last_pnl_pct, @last_value_usd, @last_polled_at,
-          @token_decimals, @entry_valuation_pnl_pct, @entry_quote_in_amount, @entry_quote_out_amount)`,
+          @token_decimals, @entry_valuation_pnl_pct, @entry_quote_in_amount, @entry_quote_out_amount,
+          @token_program, @token_account, @token_amount_raw, @entry_signature, @entry_usdc_raw, @entry_fee_lamports,
+          @entry_rent_lamports, @entry_sol_price_usd, @sell_attempts, @sell_failures, @sell_fees_lamports,
+          @failed_sell_fees_lamports, @sell_budget_lamports, @stuck_state, @stuck_since, @next_sell_at, @close_ata)`,
       )
       .run({
+        ...liveToDb({ ...DEFAULT_LIVE_FIELDS, ...pickLive(row) }),
         mode: row.mode,
         mint: row.mint,
         symbol: row.symbol,
@@ -244,6 +345,42 @@ export class PositionsStore {
       });
   }
 
+  updateLive(id: number, patch: PositionLivePatch): void {
+    const current = this.get(id);
+    if (!current) return;
+    const next = { ...current, ...patch };
+    this.db
+      .prepare(
+        `UPDATE positions SET token_amount=@token_amount, token_program=@token_program, token_account=@token_account,
+          token_amount_raw=@token_amount_raw, sell_attempts=@sell_attempts, sell_failures=@sell_failures,
+          sell_fees_lamports=@sell_fees_lamports, failed_sell_fees_lamports=@failed_sell_fees_lamports,
+          sell_budget_lamports=@sell_budget_lamports, stuck_state=@stuck_state, stuck_since=@stuck_since,
+          next_sell_at=@next_sell_at, close_ata=@close_ata
+        WHERE id=@id`,
+      )
+      .run({
+        id,
+        token_amount: next.tokenAmount,
+        token_program: next.tokenProgram,
+        token_account: next.tokenAccount,
+        token_amount_raw: next.tokenAmountRaw,
+        sell_attempts: next.sellAttempts,
+        sell_failures: next.sellFailures,
+        sell_fees_lamports: next.sellFeesLamports,
+        failed_sell_fees_lamports: next.failedSellFeesLamports,
+        sell_budget_lamports: next.sellBudgetLamports,
+        stuck_state: next.stuckState,
+        stuck_since: next.stuckSince,
+        next_sell_at: next.nextSellAt,
+        close_ata: next.closeAta ? 1 : 0,
+      });
+  }
+
+  /** Every open or closing position, of any mode (startup mode-switch check, SPEC.md section 16.8). */
+  listAllActive(): PositionRow[] {
+    return (this.db.prepare("SELECT * FROM positions ORDER BY entry_time ASC").all() as PositionRowDb[]).map(fromDb);
+  }
+
   remove(id: number): void {
     this.db.prepare("DELETE FROM position_history WHERE position_id = ?").run(id);
     this.db.prepare("DELETE FROM positions WHERE id = ?").run(id);
@@ -260,6 +397,36 @@ export class PositionsStore {
       .all(positionId, sinceT) as Array<{ t: number; pnl_pct: number }>;
     return rows.map((r) => ({ t: r.t, pnl: r.pnl_pct }));
   }
+}
+
+const LIVE_KEYS = Object.keys(DEFAULT_LIVE_FIELDS) as Array<keyof PositionLiveFields>;
+
+function pickLive(row: Partial<PositionLiveFields>): Partial<PositionLiveFields> {
+  const out: Partial<PositionLiveFields> = {};
+  for (const k of LIVE_KEYS) if (row[k] !== undefined) (out as Record<string, unknown>)[k] = row[k];
+  return out;
+}
+
+function liveToDb(f: PositionLiveFields): Record<string, unknown> {
+  return {
+    token_program: f.tokenProgram,
+    token_account: f.tokenAccount,
+    token_amount_raw: f.tokenAmountRaw,
+    entry_signature: f.entrySignature,
+    entry_usdc_raw: f.entryUsdcRaw,
+    entry_fee_lamports: f.entryFeeLamports,
+    entry_rent_lamports: f.entryRentLamports,
+    entry_sol_price_usd: f.entrySolPriceUsd,
+    sell_attempts: f.sellAttempts,
+    sell_failures: f.sellFailures,
+    sell_fees_lamports: f.sellFeesLamports,
+    failed_sell_fees_lamports: f.failedSellFeesLamports,
+    sell_budget_lamports: f.sellBudgetLamports,
+    stuck_state: f.stuckState,
+    stuck_since: f.stuckSince,
+    next_sell_at: f.nextSellAt,
+    close_ata: f.closeAta ? 1 : 0,
+  };
 }
 
 /** Reconstructs the pure ExitState from a persisted PositionRow + its loaded history (for restarts). */

@@ -17,7 +17,8 @@ type JsonRpcResponse<T> = JsonRpcSuccess<T> | JsonRpcFailure;
 export interface RpcClientOptions {
   /** SOLANA_RPC_URL — a secret; never log it directly (the logger redacts it too, but don't rely on that alone). */
   url: string;
-  limiter: SlidingWindowLimiter;
+  /** Any `{ acquire() }` limiter: the RPC lane limiter's read lane in production (section 16.10). */
+  limiter: Pick<SlidingWindowLimiter, "acquire">;
   timeoutMs?: number;
   logger: Logger;
   fetchImpl?: typeof fetch;

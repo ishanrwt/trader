@@ -10,9 +10,12 @@
     "start": "tsx src/index.ts",
     "report": "tsx src/report/cli.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke-live": "tsx src/live/smokeCli.ts"
   },
   "dependencies": {
+    "@solana-program/token": "^0.17.0",
+    "@solana/kit": "^8.3.0",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^18.0.3",
     "pino": "^10.3.1",

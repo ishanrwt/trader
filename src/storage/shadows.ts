@@ -31,6 +31,8 @@ export interface ShadowRow {
   proceeds: number | null;
   netPnlUsd: number | null;
   netPnlPct: number | null;
+  /** The mode of the run that created this shadow (SPEC.md section 11.2); rows from before Phase 3 are paper. */
+  mode?: string;
 }
 
 export type NewShadowRow = Omit<ShadowRow, "id">;
@@ -64,6 +66,7 @@ interface ShadowRowDb {
   proceeds: number | null;
   net_pnl_usd: number | null;
   net_pnl_pct: number | null;
+  mode: string;
 }
 
 function fromDb(row: ShadowRowDb): ShadowRow {
@@ -95,6 +98,7 @@ function fromDb(row: ShadowRowDb): ShadowRow {
     proceeds: row.proceeds,
     netPnlUsd: row.net_pnl_usd,
     netPnlPct: row.net_pnl_pct,
+    mode: row.mode,
   };
 }
 
@@ -108,10 +112,10 @@ export class ShadowsStore {
         `INSERT INTO shadows (
           mint, symbol, pair_address, outcome, entry_time, cost_basis, token_amount, entry_liquidity_usd, entry_price_usd,
           score, score_components, peak_pnl, current_target, target_extensions, timer_restarts, last_restart_at,
-          deadline, trail_armed, fast_streak, low_liq_streak, no_route_since, exit_time, exit_reason, proceeds, net_pnl_usd, net_pnl_pct
+          deadline, trail_armed, fast_streak, low_liq_streak, no_route_since, exit_time, exit_reason, proceeds, net_pnl_usd, net_pnl_pct, mode
         ) VALUES (@mint, @symbol, @pair_address, @outcome, @entry_time, @cost_basis, @token_amount, @entry_liquidity_usd, @entry_price_usd,
           @score, @score_components, @peak_pnl, @current_target, @target_extensions, @timer_restarts, @last_restart_at,
-          @deadline, @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @exit_time, @exit_reason, @proceeds, @net_pnl_usd, @net_pnl_pct)`,
+          @deadline, @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @exit_time, @exit_reason, @proceeds, @net_pnl_usd, @net_pnl_pct, @mode)`,
       )
       .run({
         mint: row.mint,
@@ -138,6 +142,7 @@ export class ShadowsStore {
         exit_time: row.exitTime,
         exit_reason: row.exitReason,
         proceeds: row.proceeds,
+        mode: row.mode ?? "paper",
         net_pnl_usd: row.netPnlUsd,
         net_pnl_pct: row.netPnlPct,
       });

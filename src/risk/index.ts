@@ -1,5 +1,44 @@
 import { tradingDayKey } from "../time.js";
 
+/**
+ * SPEC.md section 9.1 per-mode accounting: the daily-loss halt, loss streak and
+ * loss pause are stored per mode, so paper never affects live limits and vice
+ * versa. Migration 0004 copied the Phase 2 (paper-only) keys to their `:paper` names.
+ */
+export function perModeKey(base: "dailyLossHaltDay" | "lossStreak" | "lossPauseUntil", mode: string): string {
+  return `${base}:${mode}`;
+}
+
+/**
+ * SPEC.md section 9.1 (A12): realized net PnL for one trading day, counting
+ * only the given mode's trades, minus that mode's fee losses from failed
+ * transactions (section 16.3; paper mode never has any).
+ */
+export function realizedNetPnlForDay(
+  trades: ReadonlyArray<{ mode: string; tradingDay: string; netPnlUsd: number }>,
+  feeLosses: ReadonlyArray<{ mode: string; tradingDay: string; usd: number }>,
+  mode: string,
+  tradingDay: string,
+): number {
+  const realized = trades.filter((t) => t.mode === mode && t.tradingDay === tradingDay).reduce((s, t) => s + t.netPnlUsd, 0);
+  const fees = feeLosses.filter((f) => f.mode === mode && f.tradingDay === tradingDay).reduce((s, f) => s + f.usd, 0);
+  return realized - fees;
+}
+
+/** Σ min(0, value − costBasis) over the given mode's open positions with a known value (section 9.1). */
+export function unrealizedLossForMode(
+  positions: ReadonlyArray<{ id: number; mode: string; costBasis: number }>,
+  lastValueUsd: ReadonlyMap<number, number>,
+  mode: string,
+): number {
+  return positions
+    .filter((p) => p.mode === mode)
+    .reduce((sum, p) => {
+      const v = lastValueUsd.get(p.id);
+      return v === undefined ? sum : sum + Math.min(0, v - p.costBasis);
+    }, 0);
+}
+
 export type EntryBlockerReason = "kill_switch" | "paused" | "daily_loss_halt" | "loss_streak_pause" | "error_halt" | "slots_full";
 
 export interface EntryBlockerState {
@@ -89,4 +128,19 @@ export interface KillSwitchCheckResult {
 export function checkKillSwitch(previouslyActive: boolean, killFileExists: boolean, killFlagSet: boolean): KillSwitchCheckResult {
   const active = killFileExists || killFlagSet;
   return { active, justActivated: active && !previouslyActive };
+}
+
+/**
+ * SPEC.md section 16.5: a `reconciled` close (proceeds_unknown) may not be a
+ * real loss (e.g. a manual sale, possibly at a profit), so it neither extends
+ * nor resets the loss streak. It still counts in daily loss (conservative).
+ */
+export function applyTradeToLossStreak(
+  state: LossStreakState,
+  trade: { netPnlUsd: number; proceedsUnknown: boolean },
+  now: number,
+  cfg: LossStreakConfig,
+): LossStreakState {
+  if (trade.proceedsUnknown) return state;
+  return recordTradeOutcome(state, trade.netPnlUsd, now, cfg);
 }

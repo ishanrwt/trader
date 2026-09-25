@@ -52,6 +52,17 @@ export function listField(defaultValue: string[]) {
   return z.preprocess(toList, z.array(z.string().min(1)).default(defaultValue));
 }
 
+/** Comma-separated numbers, e.g. STUCK_BACKOFF_SECONDS=30,60,120. At least one value. */
+export function numberListField(defaultValue: number[]) {
+  return z.preprocess(
+    (v) => {
+      const list = toList(v);
+      return Array.isArray(list) ? list.map((s) => toNumber(s)) : list;
+    },
+    z.array(z.number()).min(1).default(defaultValue),
+  );
+}
+
 export function requiredStringField() {
   return z.preprocess((v) => (v === "" ? undefined : v), z.string().min(1));
 }

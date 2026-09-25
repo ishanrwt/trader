@@ -15,6 +15,15 @@ export interface TradeRecord {
   top10Pct: number | null;
   score: number | null;
   scoreComponents: { buyPressure: number; activity: number; momentum: number; depth: number; holders: number; freshness: number } | null;
+  /** A `reconciled` close whose proceeds are unknown (section 16.5): shown separately; excluded from win rate, median, mean and percentiles. */
+  proceedsUnknown?: boolean;
+}
+
+/** Fees of failed live transactions (section 16.3): realized losses outside any trade. */
+export interface FeeLossRecord {
+  ts: number;
+  tradingDay: string;
+  usd: number;
 }
 
 export interface TotalsResult {
@@ -30,19 +39,35 @@ export interface TotalsResult {
   avgLossUsd: number;
   totalNetPnlUsd: number;
   maxDrawdownUsd: number;
+  /** Trades whose proceeds are unknown (counted in total and drawdown only). */
+  proceedsUnknownCount: number;
+  proceedsUnknownUsd: number;
+  feeLossCount: number;
+  feeLossUsd: number;
 }
 
 /** SPEC.md section 11.4: totals. A win is net PnL USD > 0 (section 11.1). */
-export function computeTotals(trades: readonly TradeRecord[]): TotalsResult {
-  const pnlUsd = trades.map((t) => t.netPnlUsd);
-  const pnlPct = trades.map((t) => t.netPnlPct);
-  const wins = trades.filter((t) => t.netPnlUsd > 0);
-  const losses = trades.filter((t) => t.netPnlUsd <= 0);
-  const chronological = [...trades].sort((a, b) => a.exitTime - b.exitTime).map((t) => t.netPnlUsd);
+export function computeTotals(trades: readonly TradeRecord[], feeLosses: readonly FeeLossRecord[] = []): TotalsResult {
+  // Section 16.5: proceeds_unknown trades stay out of the per-trade statistics; they count in total and drawdown only.
+  const known = trades.filter((t) => !t.proceedsUnknown);
+  const unknown = trades.filter((t) => t.proceedsUnknown);
+  const pnlUsd = known.map((t) => t.netPnlUsd);
+  const pnlPct = known.map((t) => t.netPnlPct);
+  const wins = known.filter((t) => t.netPnlUsd > 0);
+  const losses = known.filter((t) => t.netPnlUsd <= 0);
+  // Section 16.3: fee losses of failed transactions count toward total net PnL and max drawdown.
+  const chronological = [
+    ...trades.map((t) => ({ at: t.exitTime, usd: t.netPnlUsd })),
+    ...feeLosses.map((f) => ({ at: f.ts, usd: -f.usd })),
+  ]
+    .sort((a, b) => a.at - b.at)
+    .map((e) => e.usd);
+  const unknownUsd = unknown.reduce((s, t) => s + t.netPnlUsd, 0);
+  const feeLossUsd = feeLosses.reduce((s, f) => s + f.usd, 0);
 
   return {
     trades: trades.length,
-    winRate: trades.length > 0 ? wins.length / trades.length : 0,
+    winRate: known.length > 0 ? wins.length / known.length : 0,
     medianNetPnlPct: median(pnlPct),
     meanNetPnlPct: mean(pnlPct),
     medianNetPnlUsd: median(pnlUsd),
@@ -51,8 +76,12 @@ export function computeTotals(trades: readonly TradeRecord[]): TotalsResult {
     p90NetPnlPct: percentile(pnlPct, 90),
     avgWinUsd: wins.length > 0 ? mean(wins.map((t) => t.netPnlUsd)) : 0,
     avgLossUsd: losses.length > 0 ? mean(losses.map((t) => t.netPnlUsd)) : 0,
-    totalNetPnlUsd: pnlUsd.reduce((a, b) => a + b, 0),
+    totalNetPnlUsd: pnlUsd.reduce((a, b) => a + b, 0) + unknownUsd - feeLossUsd,
     maxDrawdownUsd: maxDrawdown(chronological),
+    proceedsUnknownCount: unknown.length,
+    proceedsUnknownUsd: unknownUsd,
+    feeLossCount: feeLosses.length,
+    feeLossUsd,
   };
 }
 
@@ -260,20 +289,39 @@ export function formatReport(input: {
   skipTracks: readonly SkipTrackRecord[];
   hasStuckPositions: boolean;
   goLiveConfig: GoLiveConfig;
+  /** Live only: fees of failed transactions in the same period (section 16.3). */
+  feeLosses?: readonly FeeLossRecord[];
+  /** Section 11.4: a heading naming the mode when both modes are printed. */
+  modeLabel?: string;
 }): string {
-  const totals = computeTotals(input.trades);
+  const totals = computeTotals(input.trades, input.feeLosses ?? []);
   const byReason = breakdownByExitReason(input.trades);
   const byDay = breakdownByTradingDay(input.trades);
   const scoreQuintiles = quantileBuckets(input.trades, (t) => t.score, 5);
-  const correlations = scoreComponentCorrelations(input.trades);
+  const correlations = scoreComponentCorrelations(input.trades.filter((t) => !t.proceedsUnknown));
   const skipStats = skipReasonStats(input.skipTracks);
   const checklist = goLiveChecklist(input.paperTrades, input.hasStuckPositions, input.goLiveConfig);
 
   const lines: string[] = [];
+  if (input.modeLabel) lines.push(`##### ${input.modeLabel} #####`);
   lines.push(`=== Report (${input.trades.length} trades) ===`);
+  if (input.modeLabel && input.trades.length === 0) lines.push(`No ${input.modeLabel.toLowerCase()} trades in this period.`);
   lines.push(
     `Win rate ${(totals.winRate * 100).toFixed(1)}%, median ${totals.medianNetPnlPct.toFixed(1)}%, total $${totals.totalNetPnlUsd.toFixed(2)}, max drawdown $${totals.maxDrawdownUsd.toFixed(2)}`,
   );
+  if (totals.proceedsUnknownCount > 0) {
+    lines.push(
+      `Proceeds unknown (reconciled, shown separately; excluded from win rate/median/mean/percentiles, included in total): ${totals.proceedsUnknownCount} trades, $${totals.proceedsUnknownUsd.toFixed(2)}`,
+    );
+  }
+  if (input.feeLosses) {
+    const byDayFees = new Map<string, number>();
+    for (const f of input.feeLosses) byDayFees.set(f.tradingDay, (byDayFees.get(f.tradingDay) ?? 0) + f.usd);
+    lines.push(
+      `Fee losses from failed transactions (in total and drawdown): ${totals.feeLossCount}, $${totals.feeLossUsd.toFixed(4)}` +
+        (byDayFees.size > 0 ? ` (${[...byDayFees].map(([d, u]) => `${d}: $${u.toFixed(4)}`).join(", ")})` : ""),
+    );
+  }
   lines.push(`By exit reason: ${Object.entries(byReason).map(([r, t]) => `${r}=${t.trades}`).join(", ") || "none"}`);
   lines.push(`Trading days: ${Object.keys(byDay).length}`);
   lines.push(`Score quintiles (trades/win rate): ${scoreQuintiles.map((b) => `${b.count}/${(b.totals.winRate * 100).toFixed(0)}%`).join(", ") || "none"}`);
@@ -339,6 +387,30 @@ export interface TradeDetailRecord {
   exitQuoteInAmount: string | null;
   exitQuoteOutAmount: string | null;
   history: readonly TradeDetailHistoryPoint[];
+  /** Live trades only (section 11.1): what the confirmed transactions actually did. */
+  live?: {
+    mode: string;
+    entrySignature: string | null;
+    exitSignature: string | null;
+    entryUsdcRaw: string | null;
+    entryTokensRaw: string | null;
+    exitTokensRaw: string | null;
+    exitUsdcRaw: string | null;
+    entryFeeLamports: number | null;
+    exitFeeLamports: number | null;
+    entryFeeUsd: number | null;
+    exitFeeUsd: number | null;
+    rentPaidLamports: number | null;
+    rentReclaimedLamports: number | null;
+    rentPaidUsd: number | null;
+    rentReclaimedUsd: number | null;
+    entrySolPriceUsd: number | null;
+    exitSolPriceUsd: number | null;
+    sellAttempts: number | null;
+    failedSellFeesLamports: number | null;
+    failedSellFeesUsd: number | null;
+    proceedsUnknown: boolean;
+  };
 }
 
 function fmtUsd4(v: number): string {
@@ -370,6 +442,17 @@ export function formatTradeDetail(trades: readonly TradeDetailRecord[], opts: { 
     lines.push(`  entry valuation (first exit-lane quote after fill): ${fmtPctOrNa(t.entryValuationPnlPct)}`);
     lines.push(`  entry quote (raw): ${fmtQuote(t.entryQuoteInAmount, t.entryQuoteOutAmount)}`);
     lines.push(`  exit quote (raw): ${fmtQuote(t.exitQuoteInAmount, t.exitQuoteOutAmount)}`);
+    if (t.live && t.live.mode === "live") {
+      const l = t.live;
+      const n = (v: unknown) => (v === null || v === undefined ? "n/a" : String(v));
+      const usd = (v: number | null) => (v === null ? "n/a" : fmtUsd4(v));
+      if (l.proceedsUnknown) lines.push("  PROCEEDS UNKNOWN: closed as reconciled (tokens left the wallet without a recorded sell); proceeds recorded as 0");
+      lines.push(`  entry tx: ${n(l.entrySignature)}  USDC spent (raw): ${n(l.entryUsdcRaw)}  tokens received (raw): ${n(l.entryTokensRaw)}`);
+      lines.push(`  exit tx: ${n(l.exitSignature)}  tokens sold (raw): ${n(l.exitTokensRaw)}  USDC received (raw): ${n(l.exitUsdcRaw)}`);
+      lines.push(`  network fees: entry ${n(l.entryFeeLamports)} lamports (${usd(l.entryFeeUsd)}), exit ${n(l.exitFeeLamports)} lamports (${usd(l.exitFeeUsd)})`);
+      lines.push(`  rent: paid ${n(l.rentPaidLamports)} lamports (${usd(l.rentPaidUsd)}), reclaimed ${n(l.rentReclaimedLamports)} lamports (${usd(l.rentReclaimedUsd)})`);
+      lines.push(`  SOL/USD used: entry ${n(l.entrySolPriceUsd)}, exit ${n(l.exitSolPriceUsd)}  sell attempts: ${n(l.sellAttempts)}  failed sell fees: ${n(l.failedSellFeesLamports)} lamports (${usd(l.failedSellFeesUsd)})`);
+    }
     const fmtPoints = (pts: readonly TradeDetailHistoryPoint[]) => pts.map((p) => `(${p.t}, ${p.pnl.toFixed(2)}%)`).join(", ");
     if (t.history.length === 0) {
       lines.push(`  history (first ${historyPoints} of 0): none`);

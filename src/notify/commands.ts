@@ -28,6 +28,8 @@ export async function pollAndHandleCommands(ctx: {
   logger: Logger;
   /** Audit trail (storage/events.ts) — optional so tests that don't care about it can omit it. */
   recordEvent?: (type: string, message: string) => void;
+  /** Live mode only: /sellretry <mint prefix> (SPEC.md section 16.6). Absent in paper mode. */
+  sellRetry?: (prefix: string) => string;
 }): Promise<{ nextOffset: number }> {
   const updates = await ctx.telegram.getUpdates(ctx.offset, ctx.timeoutSec);
   let nextOffset = ctx.offset;
@@ -54,8 +56,21 @@ async function handleCommand(
     buildReport: () => string;
     logger: Logger;
     recordEvent?: (type: string, message: string) => void;
+    sellRetry?: (prefix: string) => string;
   },
 ): Promise<void> {
+  if (text === "/sellretry" || text.startsWith("/sellretry ")) {
+    const prefix = text.slice("/sellretry".length).trim();
+    if (!ctx.sellRetry) {
+      await ctx.telegram.sendMessage("/sellretry only applies in live mode.");
+      return;
+    }
+    const reply = ctx.sellRetry(prefix);
+    ctx.logger.info("/sellretry", { prefix, reply });
+    ctx.recordEvent?.("sellretry", `/sellretry ${prefix}: ${reply}`);
+    await ctx.telegram.sendMessage(reply);
+    return;
+  }
   switch (text) {
     case "/status":
       await ctx.telegram.sendMessage(ctx.buildDigest());

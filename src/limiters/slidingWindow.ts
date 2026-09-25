@@ -19,8 +19,10 @@ export class SlidingWindowLimiter {
   }
 
   private prune(now: number): void {
+    // A call exactly windowMs old has aged out. (With `<`, waitMs() returned 0 at
+    // that instant while the old call was still counted, letting the cap be exceeded.)
     const cutoff = now - this.windowMs;
-    while (this.timestamps.length > 0 && this.timestamps[0]! < cutoff) {
+    while (this.timestamps.length > 0 && this.timestamps[0]! <= cutoff) {
       this.timestamps.shift();
     }
   }

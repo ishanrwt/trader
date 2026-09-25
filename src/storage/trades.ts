@@ -1,6 +1,58 @@
 import type { Db } from "./db.js";
 
-export interface TradeRow {
+/**
+ * Live-trade fields (SPEC.md section 11.1). Raw amounts are large-integer
+ * strings from the confirmed transactions. Paper trades leave them null (and
+ * proceedsUnknown false).
+ */
+export interface TradeLiveFields {
+  entrySignature: string | null;
+  exitSignature: string | null;
+  entryUsdcRaw: string | null;
+  entryTokensRaw: string | null;
+  exitTokensRaw: string | null;
+  exitUsdcRaw: string | null;
+  entryFeeLamports: number | null;
+  exitFeeLamports: number | null;
+  entryFeeUsd: number | null;
+  exitFeeUsd: number | null;
+  rentPaidLamports: number | null;
+  rentReclaimedLamports: number | null;
+  rentPaidUsd: number | null;
+  rentReclaimedUsd: number | null;
+  entrySolPriceUsd: number | null;
+  exitSolPriceUsd: number | null;
+  sellAttempts: number | null;
+  failedSellFeesLamports: number | null;
+  failedSellFeesUsd: number | null;
+  /** True only for `reconciled` closes: proceeds recorded as 0, but the loss may not be real (section 16.5). */
+  proceedsUnknown: boolean;
+}
+
+const TRADE_LIVE_DEFAULTS: TradeLiveFields = {
+  entrySignature: null,
+  exitSignature: null,
+  entryUsdcRaw: null,
+  entryTokensRaw: null,
+  exitTokensRaw: null,
+  exitUsdcRaw: null,
+  entryFeeLamports: null,
+  exitFeeLamports: null,
+  entryFeeUsd: null,
+  exitFeeUsd: null,
+  rentPaidLamports: null,
+  rentReclaimedLamports: null,
+  rentPaidUsd: null,
+  rentReclaimedUsd: null,
+  entrySolPriceUsd: null,
+  exitSolPriceUsd: null,
+  sellAttempts: null,
+  failedSellFeesLamports: null,
+  failedSellFeesUsd: null,
+  proceedsUnknown: false,
+};
+
+export interface TradeRow extends TradeLiveFields {
   id: number;
   mode: string;
   mint: string;
@@ -37,7 +89,8 @@ export interface TradeRow {
   exitQuoteOutAmount: string | null;
 }
 
-export type NewTradeRow = Omit<TradeRow, "id">;
+/** Live fields are optional on insert (paper trades omit them). */
+export type NewTradeRow = Omit<TradeRow, "id" | keyof TradeLiveFields> & Partial<TradeLiveFields>;
 
 interface TradeRowDb {
   id: number;
@@ -71,10 +124,50 @@ interface TradeRowDb {
   entry_quote_out_amount: string | null;
   exit_quote_in_amount: string | null;
   exit_quote_out_amount: string | null;
+  entry_signature: string | null;
+  exit_signature: string | null;
+  entry_usdc_raw: string | null;
+  entry_tokens_raw: string | null;
+  exit_tokens_raw: string | null;
+  exit_usdc_raw: string | null;
+  entry_fee_lamports: number | null;
+  exit_fee_lamports: number | null;
+  entry_fee_usd: number | null;
+  exit_fee_usd: number | null;
+  rent_paid_lamports: number | null;
+  rent_reclaimed_lamports: number | null;
+  rent_paid_usd: number | null;
+  rent_reclaimed_usd: number | null;
+  entry_sol_price_usd: number | null;
+  exit_sol_price_usd: number | null;
+  sell_attempts: number | null;
+  failed_sell_fees_lamports: number | null;
+  failed_sell_fees_usd: number | null;
+  proceeds_unknown: number;
 }
 
 function fromDb(row: TradeRowDb): TradeRow {
   return {
+    entrySignature: row.entry_signature,
+    exitSignature: row.exit_signature,
+    entryUsdcRaw: row.entry_usdc_raw,
+    entryTokensRaw: row.entry_tokens_raw,
+    exitTokensRaw: row.exit_tokens_raw,
+    exitUsdcRaw: row.exit_usdc_raw,
+    entryFeeLamports: row.entry_fee_lamports,
+    exitFeeLamports: row.exit_fee_lamports,
+    entryFeeUsd: row.entry_fee_usd,
+    exitFeeUsd: row.exit_fee_usd,
+    rentPaidLamports: row.rent_paid_lamports,
+    rentReclaimedLamports: row.rent_reclaimed_lamports,
+    rentPaidUsd: row.rent_paid_usd,
+    rentReclaimedUsd: row.rent_reclaimed_usd,
+    entrySolPriceUsd: row.entry_sol_price_usd,
+    exitSolPriceUsd: row.exit_sol_price_usd,
+    sellAttempts: row.sell_attempts,
+    failedSellFeesLamports: row.failed_sell_fees_lamports,
+    failedSellFeesUsd: row.failed_sell_fees_usd,
+    proceedsUnknown: row.proceeds_unknown === 1,
     id: row.id,
     mode: row.mode,
     mint: row.mint,
@@ -109,6 +202,37 @@ function fromDb(row: TradeRowDb): TradeRow {
   };
 }
 
+function definedOnly(row: Partial<TradeLiveFields>): Partial<TradeLiveFields> {
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(TRADE_LIVE_DEFAULTS) as Array<keyof TradeLiveFields>) if (row[k] !== undefined) out[k] = row[k];
+  return out as Partial<TradeLiveFields>;
+}
+
+function tradeLiveToDb(f: TradeLiveFields): Record<string, unknown> {
+  return {
+    entry_signature: f.entrySignature,
+    exit_signature: f.exitSignature,
+    entry_usdc_raw: f.entryUsdcRaw,
+    entry_tokens_raw: f.entryTokensRaw,
+    exit_tokens_raw: f.exitTokensRaw,
+    exit_usdc_raw: f.exitUsdcRaw,
+    entry_fee_lamports: f.entryFeeLamports,
+    exit_fee_lamports: f.exitFeeLamports,
+    entry_fee_usd: f.entryFeeUsd,
+    exit_fee_usd: f.exitFeeUsd,
+    rent_paid_lamports: f.rentPaidLamports,
+    rent_reclaimed_lamports: f.rentReclaimedLamports,
+    rent_paid_usd: f.rentPaidUsd,
+    rent_reclaimed_usd: f.rentReclaimedUsd,
+    entry_sol_price_usd: f.entrySolPriceUsd,
+    exit_sol_price_usd: f.exitSolPriceUsd,
+    sell_attempts: f.sellAttempts,
+    failed_sell_fees_lamports: f.failedSellFeesLamports,
+    failed_sell_fees_usd: f.failedSellFeesUsd,
+    proceeds_unknown: f.proceedsUnknown ? 1 : 0,
+  };
+}
+
 /** DB access for `trades` (SPEC.md section 11.1). */
 export class TradesStore {
   constructor(private readonly db: Db) {}
@@ -121,14 +245,23 @@ export class TradesStore {
           net_pnl_usd, net_pnl_pct, exit_reason, peak_pnl, timer_restarts, target_extensions, fees_usd,
           entry_pair_snapshot, top1_pct, top10_pct, score, score_components, animal_flag, trading_day,
           token_amount, token_decimals, entry_valuation_pnl_pct, entry_quote_in_amount, entry_quote_out_amount,
-          exit_quote_in_amount, exit_quote_out_amount
+          exit_quote_in_amount, exit_quote_out_amount,
+          entry_signature, exit_signature, entry_usdc_raw, entry_tokens_raw, exit_tokens_raw, exit_usdc_raw,
+          entry_fee_lamports, exit_fee_lamports, entry_fee_usd, exit_fee_usd, rent_paid_lamports, rent_reclaimed_lamports,
+          rent_paid_usd, rent_reclaimed_usd, entry_sol_price_usd, exit_sol_price_usd, sell_attempts,
+          failed_sell_fees_lamports, failed_sell_fees_usd, proceeds_unknown
         ) VALUES (@mode, @mint, @symbol, @pair_address, @entry_time, @exit_time, @size_usd, @cost_basis, @proceeds,
           @net_pnl_usd, @net_pnl_pct, @exit_reason, @peak_pnl, @timer_restarts, @target_extensions, @fees_usd,
           @entry_pair_snapshot, @top1_pct, @top10_pct, @score, @score_components, @animal_flag, @trading_day,
           @token_amount, @token_decimals, @entry_valuation_pnl_pct, @entry_quote_in_amount, @entry_quote_out_amount,
-          @exit_quote_in_amount, @exit_quote_out_amount)`,
+          @exit_quote_in_amount, @exit_quote_out_amount,
+          @entry_signature, @exit_signature, @entry_usdc_raw, @entry_tokens_raw, @exit_tokens_raw, @exit_usdc_raw,
+          @entry_fee_lamports, @exit_fee_lamports, @entry_fee_usd, @exit_fee_usd, @rent_paid_lamports, @rent_reclaimed_lamports,
+          @rent_paid_usd, @rent_reclaimed_usd, @entry_sol_price_usd, @exit_sol_price_usd, @sell_attempts,
+          @failed_sell_fees_lamports, @failed_sell_fees_usd, @proceeds_unknown)`,
       )
       .run({
+        ...tradeLiveToDb({ ...TRADE_LIVE_DEFAULTS, ...definedOnly(row) }),
         mode: row.mode,
         mint: row.mint,
         symbol: row.symbol,

@@ -5,6 +5,7 @@ import {
   intField,
   listField,
   numberField,
+  numberListField,
   optionalStringField,
   requiredStringField,
 } from "./fields.js";
@@ -110,6 +111,7 @@ export const envSchema = z.object({
   ENTRY_MIN_BUDGET_PER_MIN: intField(10),
   AUTO_STRETCH_POLL: boolField(false),
   RPC_MAX_RPS: intField(8),
+  RPC_SEND_MAX_RPS: intField(1),
 
   // ---- Paper mode ----
   PAPER_STARTING_USDC: numberField(500),
@@ -143,9 +145,13 @@ export const envSchema = z.object({
   SELL_SLIPPAGE_BPS_START: intField(300),
   SELL_SLIPPAGE_BPS_MAX: intField(2000),
   MAX_PRIORITY_FEE_SOL: numberField(0.0005),
+  PRIORITY_FEE_PERCENTILE: optionalStringField("high"),
   MIN_SOL_BALANCE: numberField(0.05),
   CLOSE_EMPTY_ATA: boolField(true),
   SELL_RETRY_SECONDS: numberField(10),
+  STUCK_BACKOFF_SECONDS: numberListField([30, 60, 120, 300, 600]),
+  SELL_FEE_BUDGET_SOL: numberField(0.005),
+  TX_CONFIRM_POLL_SECONDS: numberField(2),
 });
 
 export type RawConfig = z.infer<typeof envSchema>;

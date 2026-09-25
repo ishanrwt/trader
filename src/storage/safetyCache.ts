@@ -20,4 +20,26 @@ export class SafetyCacheStore {
       )
       .run({ mint, passed: result.passed ? 1 : 0, reason: result.reason, checked_at: now });
   }
+
+  /**
+   * The mint's owning token program and decimals, learned from the same mint
+   * account the check-7 safety result came from. Live closes each token account
+   * with the mint's own program (SPEC.md section 16.6). Only updates a row that
+   * already exists (set() first).
+   */
+  setMintInfo(mint: string, info: { tokenProgram: string; decimals: number }): void {
+    this.db.prepare("UPDATE safety_cache SET token_program = @token_program, decimals = @decimals WHERE mint = @mint").run({
+      mint,
+      token_program: info.tokenProgram,
+      decimals: info.decimals,
+    });
+  }
+
+  getMintInfo(mint: string): { tokenProgram: string; decimals: number } | undefined {
+    const row = this.db.prepare("SELECT token_program, decimals FROM safety_cache WHERE mint = ?").get(mint) as
+      | { token_program: string | null; decimals: number | null }
+      | undefined;
+    if (!row || row.token_program === null || row.decimals === null) return undefined;
+    return { tokenProgram: row.token_program, decimals: row.decimals };
+  }
 }

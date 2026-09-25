@@ -6,6 +6,7 @@ import { JupiterClient } from "./clients/jupiter.js";
 import { SolanaRpcClient } from "./clients/rpc.js";
 import { TelegramClient } from "./clients/telegram.js";
 import { ConfigError, KNOWN_ENV_KEYS, loadConfig, unknownKeys, type Config } from "./config/index.js";
+import { BASE_FEE_LAMPORTS } from "./config/validate.js";
 import { loadEnv } from "./config/loadEnv.js";
 import { SOLANA_CHAIN_ID, USDC_DECIMALS, USDC_MINT, WRAPPED_SOL_MINT } from "./constants.js";
 import { pollProfiles, recheckPending, type Phase2GateDeps } from "./discovery/index.js";
@@ -42,7 +43,25 @@ import {
   buildStuckSellMessage,
 } from "./notify/urgent.js";
 import { computeTotals, formatReport, type TradeRecord } from "./report/index.js";
-import { checkEntryBlockers, checkKillSwitch, recordTradeOutcome, updateDailyLossHalt, type EntryBlockerState } from "./risk/index.js";
+import {
+  checkEntryBlockers,
+  checkKillSwitch,
+  perModeKey,
+  realizedNetPnlForDay,
+  applyTradeToLossStreak,
+  unrealizedLossForMode,
+  updateDailyLossHalt,
+  type EntryBlockerState,
+} from "./risk/index.js";
+import { LaneLimiter } from "./limiters/laneLimiter.js";
+import { IntentsStore } from "./storage/intents.js";
+import { FeeLossesStore } from "./storage/feeLosses.js";
+import { modeSwitchRefusal } from "./startup/modeGuard.js";
+import type { TradeExecutor } from "./executor/types.js";
+import type { PositionRow } from "./storage/positions.js";
+import type { TradeLiveFields } from "./storage/trades.js";
+import { ShutdownCoordinator } from "./shutdown.js";
+import { goLiveChecklist } from "./report/index.js";
 import { computePositionSizeUsd, pickNextCandidate, runSlotFilling, type ReadyCandidate } from "./selection/index.js";
 import { computeScore } from "./selection/score.js";
 import { SolPriceTracker } from "./solPrice/index.js";
@@ -130,10 +149,16 @@ function emptyHealthCounters(): HealthCounters {
   return { dexScreenerErrors: 0, rpcErrors: 0, jupiter429s: 0, downtimeGaps: [] };
 }
 
-const DAILY_LOSS_HALT_DAY_KEY = "dailyLossHaltDay";
-const LOSS_STREAK_KEY = "lossStreak";
-const LOSS_PAUSE_UNTIL_KEY = "lossPauseUntil";
 const KILL_SWITCH_WAS_ACTIVE_KEY = "killSwitchWasActive";
+/** SPEC.md section 16.11: the shutdown wait bound (pm2 kill_timeout is 150 s, above it). */
+const SHUTDOWN_WAIT_MS = 120_000;
+
+/**
+ * Scrubs secrets (the wallet key in every encoding, in live mode) from
+ * anything printed outside the logger: fatal errors and uncaught exceptions
+ * (SPEC.md section 16.9). Replaced by the logger's scrubber once it exists.
+ */
+let scrubFatal: (text: string) => string = (t) => t;
 
 async function main(): Promise<void> {
   const { env, fileKeys } = loadEnv();
@@ -149,9 +174,19 @@ async function main(): Promise<void> {
     throw err;
   }
 
+  // Live mode only: load the live module (dynamically, so paper mode never loads it)
+  // and register every encoding of the wallet key for redaction BEFORE the first log line.
+  const liveModule = config.MODE === "live" ? await import("./live/runtime.js") : null;
+  const redactions = liveModule ? liveModule.walletKeyRedactions(env) : undefined;
+
   fs.mkdirSync(LOG_DIR, { recursive: true });
   // config.LOG_LEVEL is runtime-validated against this exact set by the zod enum in schema.ts.
-  const logger = createLogger({ level: config.LOG_LEVEL as LogLevel, secrets: config.secrets, logDir: LOG_DIR });
+  const logger = createLogger({ level: config.LOG_LEVEL as LogLevel, secrets: config.secrets, logDir: LOG_DIR, ...(redactions ? { redactions } : {}) });
+  scrubFatal = logger.scrubText;
+  const mode = config.MODE;
+  const DAILY_LOSS_HALT_DAY_KEY = perModeKey("dailyLossHaltDay", mode);
+  const LOSS_STREAK_KEY = perModeKey("lossStreak", mode);
+  const LOSS_PAUSE_UNTIL_KEY = perModeKey("lossPauseUntil", mode);
 
   for (const key of unknownKeys(fileKeys, KNOWN_ENV_KEYS)) {
     logger.warn(`Unknown key in .env, ignored: ${key}`);
@@ -170,10 +205,23 @@ async function main(): Promise<void> {
   const skipTracksStore = new SkipTracksStore(db);
   const postExitTracksStore = new PostExitTracksStore(db);
   const safetyCacheStore = new SafetyCacheStore(db);
+  const intentsStore = new IntentsStore(db);
+  const feeLossesStore = new FeeLossesStore(db);
+
+  // SPEC.md section 16.8: refuse to start while positions or unresolved intents of the other mode exist.
+  const refusal = modeSwitchRefusal(mode, positionsStore.listAllActive(), intentsStore.listUnresolved());
+  if (refusal) {
+    logger.fatal(refusal);
+    console.error(refusal);
+    db.close();
+    process.exit(1);
+  }
 
   const dexProfilesLimiter = new SlidingWindowLimiter(config.DEX_PROFILES_MAX_PER_MIN, 60_000);
   const dexPairsLimiter = new SlidingWindowLimiter(config.DEX_PAIRS_MAX_PER_MIN, 60_000);
-  const rpcLimiter = new SlidingWindowLimiter(config.RPC_MAX_RPS, 1_000);
+  // Section 16.10: one RPC_MAX_RPS window, transaction lane served before the read lane.
+  const rpcLanes = new LaneLimiter(config.RPC_MAX_RPS, 1_000);
+  const rpcLimiter = rpcLanes.lane("read");
   const jupiterPhysicalLimiter = new SlidingWindowLimiter(config.JUPITER_MAX_REQ_PER_MIN, 60_000, config.JUPITER_MIN_INTERVAL_MS);
   const jupiterLaneBudget = new JupiterLaneBudget({
     jupiterMaxReqPerMin: config.JUPITER_MAX_REQ_PER_MIN,
@@ -183,7 +231,7 @@ async function main(): Promise<void> {
   const dexClient = new DexScreenerClient({ profilesLimiter: dexProfilesLimiter, pairsLimiter: dexPairsLimiter, logger });
   const rpcClient = new SolanaRpcClient({ url: config.SOLANA_RPC_URL, limiter: rpcLimiter, logger });
   const jupiterClient = new JupiterClient({ apiKey: config.JUPITER_API_KEY, physicalLimiter: jupiterPhysicalLimiter, logger });
-  const telegram = new TelegramClient({ botToken: config.TRADER_TELEGRAM_BOT_TOKEN, chatId: config.TRADER_TELEGRAM_CHAT_ID, logger });
+  const telegram = new TelegramClient({ botToken: config.TRADER_TELEGRAM_BOT_TOKEN, chatId: config.TRADER_TELEGRAM_CHAT_ID, logger, scrubText: logger.scrubText });
 
   const wallet = new VirtualWallet(stateStore, { usdc: config.PAPER_STARTING_USDC, sol: config.PAPER_STARTING_SOL });
 
@@ -274,6 +322,11 @@ async function main(): Promise<void> {
       allowedToken2022Extensions: ["metadataPointer", "tokenMetadata", "groupPointer", "groupMemberPointer", "tokenGroup", "tokenGroupMember"],
     });
     safetyCacheStore.set(mint, result, Date.now());
+    // Phase 3: remember the mint's owning token program and decimals (closeAccount uses the mint's own program, section 16.6).
+    const v = value as { owner?: unknown; data?: { parsed?: { info?: { decimals?: unknown } } } } | null;
+    if (typeof v?.owner === "string" && typeof v.data?.parsed?.info?.decimals === "number") {
+      safetyCacheStore.setMintInfo(mint, { tokenProgram: v.owner, decimals: v.data.parsed.info.decimals });
+    }
     return result;
   }
 
@@ -355,6 +408,7 @@ async function main(): Promise<void> {
       symbol: pair.baseToken.symbol ?? null,
       pairAddress: pair.pairAddress,
       outcome: "open",
+      mode: config.MODE,
       entryTime: now,
       costBasis: entry.costBasis,
       tokenAmount: entry.tokens,
@@ -414,12 +468,79 @@ async function main(): Promise<void> {
 
   const controller = new AbortController();
   const { signal } = controller;
-  for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.once(sig, () => {
-      logger.info(`Received ${sig}, shutting down`);
-      heartbeat(stateStore, Date.now());
+
+  // ---- In-flight paper fills, awaited by graceful shutdown (section 16.11) ----
+  const inFlightWork = new Set<Promise<unknown>>();
+  function trackWork<T>(p: Promise<T>): Promise<T> {
+    inFlightWork.add(p);
+    void p.finally(() => inFlightWork.delete(p)).catch(() => undefined);
+    return p;
+  }
+  let shuttingDown = false;
+
+  // ---- Live runtime (Phase 3): only when MODE=live (the module was loaded dynamically above) ----
+  type LiveRuntimeT = Awaited<ReturnType<NonNullable<typeof liveModule>["createLiveRuntime"]>>;
+  type LiveHooksT = Parameters<NonNullable<typeof liveModule>["createLiveRuntime"]>[0]["hooks"];
+  const live: LiveRuntimeT | null = liveModule
+    ? await liveModule.createLiveRuntime({
+        config,
+        env,
+        logger,
+        rpcLanes,
+        jupiter: jupiterClient,
+        intents: intentsStore,
+        positions: positionsStore,
+        feeLosses: feeLossesStore,
+        safetyCache: safetyCacheStore,
+        hooks: makeLiveHooks(),
+      })
+    : null;
+  const executor: TradeExecutor = live ? makeLiveExecutor(live) : makePaperExecutor();
+
+  const shutdown = new ShutdownCoordinator({
+    source: process as unknown as import("./shutdown.js").ShutdownSource,
+    logger,
+    boundMs: SHUTDOWN_WAIT_MS,
+    stopNew: () => {
+      shuttingDown = true;
+      live?.executor.stopNewTransactions();
       controller.abort();
+    },
+    waitForInFlight: async (boundMs) => {
+      const deadline = Date.now() + boundMs;
+      const liveDone = live ? await live.executor.waitIdle(boundMs) : true;
+      while (inFlightWork.size > 0 && Date.now() < deadline) {
+        await Promise.race([Promise.allSettled([...inFlightWork]), sleepMs(250)]);
+      }
+      return liveDone && inFlightWork.size === 0;
+    },
+    finalize: () => {
+      heartbeat(stateStore, Date.now());
+      db.close();
+    },
+    exit: (code) => process.exit(code),
+  });
+  shutdown.install();
+
+  if (live) {
+    logger.info("Live mode: wallet loaded", { address: live.address, sellFeeReserveSol: config.sellFeeReserveSol });
+    // Section 16.8: the paper go-live checklist informs, never blocks.
+    const checklist = goLiveChecklist(tradeRowsToRecords("paper"), false, {
+      minTrades: config.GOLIVE_MIN_TRADES,
+      minDays: config.GOLIVE_MIN_DAYS,
+      minMedianPnlPct: config.GOLIVE_MIN_MEDIAN_PNL_PCT,
+      minTotalPnlUsd: config.GOLIVE_MIN_TOTAL_PNL_USD,
+      minP10PnlPct: config.GOLIVE_MIN_P10_PNL_PCT,
     });
+    const failed = checklist.filter((c) => !c.pass);
+    if (failed.length > 0) {
+      const text = `Live mode started while the paper go-live checklist is NOT met (continuing anyway): ${failed.map((c) => `${c.check} (${c.detail})`).join("; ")}`;
+      logger.warn(text);
+      await telegram.sendMessage(text);
+    }
+    // Section 16.5: resolve every unresolved intent, then reconcile, before any loop runs.
+    await live.executor.startup();
+    await live.executor.readWalletBalances().catch((err: unknown) => logger.warn("Initial wallet balance read failed", { error: String(err) }));
   }
 
   async function handleOutage(service: "DexScreener" | "RPC" | "Jupiter", success: boolean): Promise<void> {
@@ -527,24 +648,13 @@ async function main(): Promise<void> {
           return false;
         }
       },
-      getExecutionQuote: async (mint, sizeUsd) => {
-        try {
-          await acquireEntryLane();
-          const usdcAmount = Math.round(sizeUsd * 10 ** USDC_DECIMALS).toString();
-          const quote = await jupiterClient.getQuote({ inputMint: USDC_MINT, outputMint: mint, amount: usdcAmount, slippageBps: config.BUY_SLIPPAGE_BPS });
-          const decimals = mintDecimalsCache.get(mint) ?? 6;
-          return { tokensOut: Number(quote.outAmount) / 10 ** decimals };
-        } catch (err) {
-          logger.warn("Execution quote failed", { mint, error: String(err) });
-          return null;
-        }
-      },
+      getExecutionQuote: (mint, sizeUsd) => executor.getExecutionQuote(mint, sizeUsd),
       positionSizeUsd: (c) => computePositionSizeUsd(config.POSITION_USD, c.liquidityUsd, config.MAX_POSITION_PCT_OF_LIQ),
-      paperFeeUsdPerTx: config.PAPER_FEE_USD_PER_TX,
-      canAfford: (usdc) => wallet.canAfford(usdc),
+      paperFeeUsdPerTx: executor.mode === "paper" ? config.PAPER_FEE_USD_PER_TX : 0,
+      canAfford: (usdc) => executor.canAfford(usdc),
       openPosition: async (candidate, execution) => {
         try {
-          await openPosition(candidate, execution);
+          await executor.open(candidate, execution);
           resetConsecutiveErrors();
         } catch (err) {
           incrementConsecutiveErrors(`Entry fill for ${candidate.mint}`, err);
@@ -586,19 +696,159 @@ async function main(): Promise<void> {
   }
 
   function unrealizedLossSum(): number {
-    return positionsStore.listOpen().reduce((sum, row) => {
-      const value = lastValueUsdByPosition.get(row.id);
-      if (value === undefined) return sum;
-      return sum + Math.min(0, value - row.costBasis);
-    }, 0);
+    return unrealizedLossForMode(positionsStore.listOpen(), lastValueUsdByPosition, config.MODE);
   }
 
   function realizedNetPnlToday(now: number): number {
     const day = tradingDayKey(now, config.TRADING_DAY_TZ);
-    return tradesStore
-      .listForTradingDay(day)
-      .filter((t) => t.mode === config.MODE)
-      .reduce((sum, t) => sum + t.netPnlUsd, 0);
+    // Section 9.1 (A12): realized trades of the current mode only, minus that mode's fee losses (section 16.3; none in paper mode).
+    return realizedNetPnlForDay(tradesStore.listForTradingDay(day), feeLossesStore.listAll({ mode: config.MODE, from: day, to: day }), config.MODE, day);
+  }
+
+  async function paperExecutionQuote(mint: string, sizeUsd: number): Promise<{ tokensOut: number } | null> {
+    try {
+      await acquireEntryLane();
+      const usdcAmount = Math.round(sizeUsd * 10 ** USDC_DECIMALS).toString();
+      const quote = await jupiterClient.getQuote({ inputMint: USDC_MINT, outputMint: mint, amount: usdcAmount, slippageBps: config.BUY_SLIPPAGE_BPS });
+      const decimals = mintDecimalsCache.get(mint) ?? 6;
+      return { tokensOut: Number(quote.outAmount) / 10 ** decimals };
+    } catch (err) {
+      logger.warn("Execution quote failed", { mint, error: String(err) });
+      return null;
+    }
+  }
+
+  /** Paper mode (Phase 2 code, unchanged in behaviour) behind the TradeExecutor interface. */
+  function makePaperExecutor(): TradeExecutor {
+    return {
+      mode: "paper",
+      getExecutionQuote: paperExecutionQuote,
+      canAfford: (usdc) => wallet.canAfford(usdc),
+      open: (candidate, execution) => trackWork(openPosition(candidate, execution)),
+      exitAttempt: (row) => trackWork(attemptExitFill(row)),
+      exitQuoteAmountRaw: (row) => Math.round(row.tokenAmount * 10 ** (mintDecimalsCache.get(row.mint) ?? 6)).toString(),
+      exitCostUsd: () => config.PAPER_FEE_USD_PER_TX,
+      walletBalances: () => wallet.get(),
+    };
+  }
+
+  /** Live mode (section 16) behind the same interface; the live module does the on-chain work. */
+  function makeLiveExecutor(rt: LiveRuntimeT): TradeExecutor {
+    return {
+      mode: "live",
+      getExecutionQuote: (mint, sizeUsd) => rt.executor.prepareBuy(mint, sizeUsd),
+      canAfford: (usdc) => rt.executor.balances().usdc >= usdc,
+      open: async (candidate, execution) => {
+        if (shuttingDown) return;
+        const readyRow = pendingStore.listReady().find((r) => r.mint === candidate.mint);
+        await rt.executor.executeBuy({
+          mint: candidate.mint,
+          sizeUsd: execution.sizeUsd,
+          score: candidate.score,
+          liquidityUsd: candidate.liquidityUsd,
+          snapshot: readyRow?.snapshot ? JSON.parse(readyRow.snapshot) : null,
+        });
+      },
+      exitAttempt: (row) => rt.executor.sellAttempt(row),
+      exitQuoteAmountRaw: (row) => row.tokenAmountRaw ?? "0",
+      exitCostUsd: (row) => rt.executor.exitCostUsd(row, solPriceTracker.get().priceUsd ?? row.entrySolPriceUsd ?? 0),
+      walletBalances: () => rt.executor.balances(),
+    };
+  }
+
+  /** The app side of the live executor: positions, trades, alerts, lanes (src/live/executor.ts LiveAppHooks). */
+  function makeLiveHooks(): LiveHooksT {
+    return {
+      recordBuy: async (payload, fill, info) => {
+        // Idempotent on the entry signature: a buy is never recorded twice (restart during apply).
+        const existing = positionsStore.listAllActive().find((p) => p.entrySignature === info.signature);
+        if (existing) return existing.id;
+        const snap = payload.snapshot as { pair: DexPair; holders: HoldersResult; score: number; components: unknown } | null;
+        const rentUsd = fill.rentUsd;
+        const exitCost = (BASE_FEE_LAMPORTS + config.maxPriorityFeeLamports) / 1e9 * info.solPriceUsd - (config.CLOSE_EMPTY_ATA ? rentUsd : 0);
+        return recordOpenedPosition(
+          { mint: payload.mint, score: payload.score, liquidityUsd: payload.liquidityUsd },
+          snap,
+          {
+            sizeUsd: payload.sizeUsd,
+            tokens: Number(fill.tokensRaw) / 10 ** payload.decimals,
+            costBasis: fill.costBasisUsd,
+            tokenDecimals: payload.decimals,
+            entryQuoteInAmount: info.quoteInAmount,
+            entryQuoteOutAmount: info.quoteOutAmount,
+            entryTime: info.entryTime,
+            valuationAmountRaw: fill.tokensRaw.toString(),
+            exitCostUsd: exitCost,
+            live: {
+              tokenProgram: fill.tokenAccount?.program ?? payload.tokenProgram,
+              tokenAccount: fill.tokenAccount?.address ?? null,
+              tokenAmountRaw: fill.tokensRaw.toString(),
+              entrySignature: info.signature,
+              entryUsdcRaw: fill.usdcSpentRaw.toString(),
+              entryFeeLamports: Number(fill.feeLamports),
+              entryRentLamports: Number(fill.rentPaidLamports),
+              entrySolPriceUsd: info.solPriceUsd,
+            },
+          },
+        );
+      },
+      recordSell: async (row, fill, info) => {
+        const entryFeeUsd = row.entryFeeLamports !== null && row.entrySolPriceUsd !== null ? (row.entryFeeLamports / 1e9) * row.entrySolPriceUsd : 0;
+        const rentPaidUsd = row.entryRentLamports !== null && row.entrySolPriceUsd !== null ? (row.entryRentLamports / 1e9) * row.entrySolPriceUsd : 0;
+        await finalizeTrade(
+          row,
+          fill.proceedsUsd,
+          row.pendingExitReason ?? "time_exit",
+          { exitQuoteInAmount: info.quoteInAmount, exitQuoteOutAmount: info.quoteOutAmount },
+          {
+            feesUsd: entryFeeUsd + fill.feeUsd,
+            tradeLive: {
+              ...entryTradeFields(row),
+              exitSignature: info.signature,
+              exitTokensRaw: fill.tokensSoldRaw.toString(),
+              exitUsdcRaw: fill.usdcReceivedRaw.toString(),
+              exitFeeLamports: Number(fill.feeLamports),
+              exitFeeUsd: fill.feeUsd,
+              rentPaidUsd,
+              rentReclaimedLamports: Number(fill.rentReclaimedLamports),
+              rentReclaimedUsd: fill.rentReclaimedUsd,
+              exitSolPriceUsd: info.solPriceUsd,
+              sellAttempts: info.sellAttempts,
+              failedSellFeesLamports: row.failedSellFeesLamports,
+              failedSellFeesUsd: (row.failedSellFeesLamports / 1e9) * info.solPriceUsd,
+            },
+          },
+        );
+      },
+      closeReconciled: async (row) => {
+        logger.warn("Position closed as reconciled: its tokens left the wallet without a recorded sell (proceeds recorded as 0, proceeds_unknown)", { positionId: row.id, mint: row.mint });
+        await finalizeTrade(row, 0, "reconciled", { exitQuoteInAmount: null, exitQuoteOutAmount: null }, { proceedsUnknown: true, feesUsd: 0, tradeLive: entryTradeFields(row) });
+      },
+      alert: (text) => {
+        logger.warn(`URGENT: ${text}`);
+        logEvent(db, Date.now(), "urgent", text);
+        if (config.URGENT_ALERTS) void telegram.sendMessage(text);
+      },
+      event: (type, message, meta) => logEvent(db, Date.now(), type, message, meta),
+      solPriceUsd: () => solPriceTracker.get().priceUsd,
+      acquireEntryLane: async () => {
+        await acquireEntryLane();
+        return true;
+      },
+      recordExitLane: () => jupiterLaneBudget.recordExit(),
+    };
+  }
+
+  function entryTradeFields(row: PositionRow): Partial<TradeLiveFields> {
+    return {
+      entrySignature: row.entrySignature,
+      entryUsdcRaw: row.entryUsdcRaw,
+      entryTokensRaw: row.tokenAmountRaw,
+      entryFeeLamports: row.entryFeeLamports,
+      entryFeeUsd: row.entryFeeLamports !== null && row.entrySolPriceUsd !== null ? (row.entryFeeLamports / 1e9) * row.entrySolPriceUsd : null,
+      rentPaidLamports: row.entryRentLamports,
+      entrySolPriceUsd: row.entrySolPriceUsd,
+    };
   }
 
   async function openPosition(candidate: ReadyCandidate, execution: { tokens: number; sizeUsd: number }): Promise<void> {
@@ -634,20 +884,57 @@ async function main(): Promise<void> {
     }
     wallet.debit(fill.costBasis);
 
-    const now = Date.now();
     const tokenDecimals = mintDecimalsCache.get(candidate.mint) ?? null;
+    await recordOpenedPosition(candidate, snap, {
+      sizeUsd: execution.sizeUsd,
+      tokens: fill.tokens,
+      costBasis: fill.costBasis,
+      tokenDecimals,
+      entryQuoteInAmount,
+      entryQuoteOutAmount,
+      entryTime: Date.now(),
+      valuationAmountRaw: Math.round(fill.tokens * 10 ** (tokenDecimals ?? 6)).toString(),
+      exitCostUsd: config.PAPER_FEE_USD_PER_TX,
+    });
+  }
+
+  /**
+   * Everything after an entry fill, shared by paper fills and confirmed live
+   * buys (including buys recovered at startup, section 16.5): the entry-time
+   * valuation (section 8.1), the position row, its first history point,
+   * pending removal, shadow selection, and the funnel.
+   */
+  async function recordOpenedPosition(
+    candidate: { mint: string; score: number; liquidityUsd: number },
+    snap: { pair: DexPair; holders: HoldersResult; score: number; components: unknown } | null,
+    fill: {
+      sizeUsd: number;
+      tokens: number;
+      costBasis: number;
+      tokenDecimals: number | null;
+      entryQuoteInAmount: string | null;
+      entryQuoteOutAmount: string | null;
+      entryTime: number;
+      /** Raw token amount quoted for the entry valuation. */
+      valuationAmountRaw: string;
+      exitCostUsd: number;
+      live?: Partial<import("./storage/positions.js").PositionLiveFields>;
+    },
+  ): Promise<number> {
+    const execution = { sizeUsd: fill.sizeUsd };
+    const { tokenDecimals, entryQuoteInAmount, entryQuoteOutAmount } = fill;
+    const now = fill.entryTime;
 
     // The true entry-time mark (SPEC.md section 8.1): a just-opened position is typically
     // already below zero (round-trip fees, price impact, simulated slippage), never assumed
     // to be exactly 0%. Fetched via the exit lane, same as every later poll.
     let entryValuationPnlPct: number | null = null;
     try {
-      const decimals = tokenDecimals ?? 6;
-      const exitAmount = Math.round(fill.tokens * 10 ** decimals).toString();
-      jupiterLaneBudget.recordExit(now); // exit lane: never gated
+      const exitAmount = fill.valuationAmountRaw;
+      jupiterLaneBudget.recordExit(Date.now()); // exit lane: never gated
       const exitQuote = await jupiterClient.getQuote({ inputMint: candidate.mint, outputMint: USDC_MINT, amount: exitAmount, slippageBps: 300 });
       const quoteOutUsd = Number(exitQuote.outAmount) / 10 ** USDC_DECIMALS;
-      const valueUsd = quoteOutUsd - config.PAPER_FEE_USD_PER_TX;
+      const valueUsd = quoteOutUsd - fill.exitCostUsd;
       entryValuationPnlPct = ((valueUsd - fill.costBasis) / fill.costBasis) * 100;
     } catch (err) {
       logger.warn("Entry valuation exit-lane quote failed; first history point deferred to the first regular poll", { mint: candidate.mint, error: String(err) });
@@ -696,6 +983,7 @@ async function main(): Promise<void> {
       entryValuationPnlPct,
       entryQuoteInAmount,
       entryQuoteOutAmount,
+      ...(fill.live ?? {}),
     });
     if (state.history.length > 0) positionsStore.appendHistory(id, state.history[0]!);
     pendingStore.removePending(candidate.mint); // bought (section 4)
@@ -707,7 +995,8 @@ async function main(): Promise<void> {
     funnel.scoreRangeOfEntries = funnel.scoreRangeOfEntries
       ? { min: Math.min(funnel.scoreRangeOfEntries.min, candidate.score), max: Math.max(funnel.scoreRangeOfEntries.max, candidate.score) }
       : { min: candidate.score, max: candidate.score };
-    logEvent(db, now, "entry", `Opened ${candidate.mint}`, { mint: candidate.mint, sizeUsd: execution.sizeUsd, score: candidate.score });
+    logEvent(db, Date.now(), "entry", `Opened ${candidate.mint}`, { mint: candidate.mint, sizeUsd: execution.sizeUsd, score: candidate.score });
+    return id;
   }
 
   // ---- Monitoring loop (section 8.1) ----
@@ -728,14 +1017,14 @@ async function main(): Promise<void> {
     });
   }
 
-  async function fetchExitQuote(row: { mint: string; tokenAmount: number; id: number }, now: number): Promise<number | null> {
+  async function fetchExitQuote(row: PositionRow, now: number): Promise<number | null> {
     jupiterLaneBudget.recordExit(now); // exit lane: never gated
     try {
-      const decimals = mintDecimalsCache.get(row.mint) ?? 6;
-      const amount = Math.round(row.tokenAmount * 10 ** decimals).toString();
+      // Paper: stored amount x decimals (Phase 2, unchanged). Live: the raw on-chain amount (section 8.1).
+      const amount = executor.exitQuoteAmountRaw(row);
       const quote = await jupiterClient.getQuote({ inputMint: row.mint, outputMint: USDC_MINT, amount, slippageBps: 300 });
       const quoteOutUsd = Number(quote.outAmount) / 10 ** USDC_DECIMALS;
-      lastValueUsdByPosition.set(row.id, quoteOutUsd - config.PAPER_FEE_USD_PER_TX);
+      lastValueUsdByPosition.set(row.id, quoteOutUsd - executor.exitCostUsd(row));
       return quoteOutUsd;
     } catch {
       return null;
@@ -756,7 +1045,7 @@ async function main(): Promise<void> {
         fetchPnlPct: async (t: number) => {
           const quoteOutUsd = await fetchExitQuote(row, t);
           if (quoteOutUsd === null) return null;
-          const valueUsd = quoteOutUsd - config.PAPER_FEE_USD_PER_TX;
+          const valueUsd = quoteOutUsd - executor.exitCostUsd(row);
           return ((valueUsd - row.costBasis) / row.costBasis) * 100;
         },
       };
@@ -845,7 +1134,7 @@ async function main(): Promise<void> {
     triggerFireAndForget({
       id: row.id,
       inFlight: inFlightExitFills,
-      attempt: () => attemptExitFill(row),
+      attempt: () => (shuttingDown ? Promise.resolve() : executor.exitAttempt(row)),
       onError: (id, err) => incrementConsecutiveErrors(`Exit fill for position ${id} (${row.mint})`, err),
     });
   }
@@ -861,9 +1150,10 @@ async function main(): Promise<void> {
     proceeds: number,
     exitReason: string,
     exitQuote: { exitQuoteInAmount: string | null; exitQuoteOutAmount: string | null },
+    extras: { feesUsd?: number; proceedsUnknown?: boolean; tradeLive?: Partial<TradeLiveFields> } = {},
   ): Promise<void> {
     const now = Date.now();
-    wallet.credit(proceeds);
+    if (row.mode === "paper") wallet.credit(proceeds); // live proceeds are on-chain already
     const netPnlUsd = proceeds - row.costBasis;
     const netPnlPct = (netPnlUsd / row.costBasis) * 100;
     const tradingDay = tradingDayKey(now, config.TRADING_DAY_TZ);
@@ -887,7 +1177,7 @@ async function main(): Promise<void> {
       peakPnl: finalPeakPnl(row.peakPnl, netPnlPct),
       timerRestarts: row.timerRestarts,
       targetExtensions: row.targetExtensions,
-      feesUsd: config.PAPER_FEE_USD_PER_TX * 2,
+      feesUsd: extras.feesUsd ?? config.PAPER_FEE_USD_PER_TX * 2,
       entryPairSnapshot: entrySnapshot,
       top1Pct: holders?.top1Pct ?? null,
       top10Pct: holders?.top10Pct ?? null,
@@ -902,6 +1192,8 @@ async function main(): Promise<void> {
       entryQuoteOutAmount: row.entryQuoteOutAmount,
       exitQuoteInAmount: exitQuote.exitQuoteInAmount,
       exitQuoteOutAmount: exitQuote.exitQuoteOutAmount,
+      ...(extras.tradeLive ?? {}),
+      proceedsUnknown: extras.proceedsUnknown ?? false,
     });
 
     // Preserve position_history past the close (SPEC.md sections 11.1/12) — copied, not
@@ -912,9 +1204,9 @@ async function main(): Promise<void> {
     positionsStore.remove(row.id);
     lastValueUsdByPosition.delete(row.id);
 
-    const streak = recordTradeOutcome(
+    const streak = applyTradeToLossStreak(
       { consecutiveLosses: stateStore.get<number>(LOSS_STREAK_KEY, 0), pauseUntil: stateStore.get<number | null>(LOSS_PAUSE_UNTIL_KEY, null) },
-      netPnlUsd,
+      { netPnlUsd, proceedsUnknown: extras.proceedsUnknown ?? false },
       now,
       { consecutiveLossPause: config.CONSECUTIVE_LOSS_PAUSE, lossPauseMinutes: config.LOSS_PAUSE_MINUTES },
     );
@@ -1103,14 +1395,20 @@ async function main(): Promise<void> {
         top10Pct: t.top10Pct,
         score: t.score,
         scoreComponents: components,
+        proceedsUnknown: t.proceedsUnknown,
       };
     });
   }
 
+  /** /report: the current mode only (section 11.4: paper and live are never mixed). */
   function buildReport(opts: { mode?: "paper" | "live"; from?: string; to?: string } = {}): string {
-    const hasStuck = positionsStore.listClosing().some((r) => shouldWriteOff(r.closingSince ?? Date.now(), Date.now(), config.STUCK_WRITE_OFF_MIN));
+    const mode = opts.mode ?? (config.MODE as "paper" | "live");
+    const hasStuck = positionsStore
+      .listClosing()
+      .some((r) => r.stuckState !== null || (r.mode === "paper" && shouldWriteOff(r.closingSince ?? Date.now(), Date.now(), config.STUCK_WRITE_OFF_MIN)));
     return formatReport({
-      trades: tradeRowsToRecords(opts.mode, opts.from, opts.to),
+      trades: tradeRowsToRecords(mode, opts.from, opts.to),
+      ...(mode === "live" ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) } : {}),
       paperTrades: tradeRowsToRecords("paper"),
       skipTracks: skipTracksStore.listAll().map((r) => ({ skipReason: r.skipReason, priceAtSkipUsd: r.priceAtSkipUsd, price15mUsd: r.price15mUsd, price60mUsd: r.price60mUsd })),
       hasStuckPositions: hasStuck,
@@ -1134,6 +1432,7 @@ async function main(): Promise<void> {
       timeoutSec: 20,
       buildDigest: () => renderDigest(),
       buildReport: () => buildReport(),
+      ...(live ? { sellRetry: (prefix: string) => live.executor.sellRetry(prefix) } : {}),
       logger,
       recordEvent: (type, message) => logEvent(db, Date.now(), type, message),
     });
@@ -1156,12 +1455,18 @@ async function main(): Promise<void> {
     }));
 
     const lastDigestAt = stateStore.get<number>("lastDigestAt", startedAt);
-    const tradesClosed = tradesStore.listSince(lastDigestAt).map((t) => ({ symbol: t.symbol ?? t.mint.slice(0, 6), exitReason: t.exitReason, netPnlPct: t.netPnlPct, netPnlUsd: t.netPnlUsd }));
+    // Section 10 / A12: only the current mode; proceeds_unknown trades are listed separately (section 16.5).
+    const closedInWindow = tradesStore.listSince(lastDigestAt).filter((t) => t.mode === config.MODE);
+    const summarize = (t: (typeof closedInWindow)[number]) => ({ symbol: t.symbol ?? t.mint.slice(0, 6), exitReason: t.exitReason, netPnlPct: t.netPnlPct, netPnlUsd: t.netPnlUsd });
+    const tradesClosed = closedInWindow.filter((t) => !t.proceedsUnknown).map(summarize);
+    const proceedsUnknownTrades = closedInWindow.filter((t) => t.proceedsUnknown).map(summarize);
 
     const today = tradingDayKey(now, config.TRADING_DAY_TZ);
-    const todaysTrades = tradesStore.listForTradingDay(today).filter((t) => t.mode === config.MODE);
-    const todaysRecords = todaysTrades.map((t) => ({ ...t, mode: t.mode as "paper" | "live", m5ChangePct: null, h1ChangePct: null, buyPressurePct: null, liquidityUsd: null, pairAgeMs: null, scoreComponents: null }));
-    const todaysTotals = computeTotals(todaysRecords);
+    const todaysAll = tradesStore.listForTradingDay(today).filter((t) => t.mode === config.MODE);
+    const todaysTrades = todaysAll.filter((t) => !t.proceedsUnknown);
+    const todaysRecords = todaysAll.map((t) => ({ ...t, mode: t.mode as "paper" | "live", m5ChangePct: null, h1ChangePct: null, buyPressurePct: null, liquidityUsd: null, pairAgeMs: null, scoreComponents: null }));
+    const todaysFeeLosses = feeLossesStore.listAll({ mode: config.MODE, from: today, to: today });
+    const todaysTotals = computeTotals(todaysRecords, todaysFeeLosses);
     const exitReasonBreakdown: Record<string, number> = {};
     for (const t of todaysTrades) exitReasonBreakdown[t.exitReason] = (exitReasonBreakdown[t.exitReason] ?? 0) + 1;
     const wins = todaysTrades.filter((t) => t.netPnlUsd > 0);
@@ -1178,9 +1483,11 @@ async function main(): Promise<void> {
       errorHalted: stateStore.get<number>(CONSECUTIVE_ERRORS_KEY, 0) >= config.MAX_CONSECUTIVE_ERRORS,
       lossStreak: stateStore.get<number>(LOSS_STREAK_KEY, 0),
       solPriceUsd: solPriceTracker.get().priceUsd,
-      walletUsdc: wallet.get().usdc,
-      walletSol: wallet.get().sol,
+      walletUsdc: executor.walletBalances().usdc,
+      walletSol: executor.walletBalances().sol,
       tradesClosed,
+      proceedsUnknownTrades,
+      ...(live ? { live: liveDigestSection(todaysFeeLosses) } : {}),
       openPositions,
       tradingDay: {
         trades: todaysTrades.length,
@@ -1217,6 +1524,29 @@ async function main(): Promise<void> {
     return buildDigest(input);
   }
 
+  // Live counters are cumulative; the digest reports them per window.
+  let lastLiveCounters = { rpc: 0, sent: 0, landed: 0, failed: 0, expired: 0, refused: 0 };
+  function liveDigestSection(todaysFeeLosses: ReadonlyArray<{ usd: number }>): import("./notify/digest.js").LiveDigestSection {
+    const rt = live!;
+    const h = rt.executor.health;
+    const now = { rpc: rt.rpcCalls(), sent: h.sent, landed: h.landed, failed: h.failed, expired: h.expired, refused: h.refused };
+    const d = (k: keyof typeof now) => now[k] - lastLiveCounters[k];
+    const section = {
+      sellFeeReserveSol: config.sellFeeReserveSol,
+      closingPositions: positionsStore
+        .listClosing()
+        .filter((r) => r.mode === "live")
+        .map((r) => ({ symbol: r.symbol ?? r.mint.slice(0, 6), stuckState: r.stuckState, sellAttempts: r.sellAttempts, sellFeesLamports: r.sellFeesLamports })),
+      feeLossesToday: { count: todaysFeeLosses.length, usd: todaysFeeLosses.reduce((s, f) => s + f.usd, 0) },
+      rpcRequests: d("rpc"),
+      tx: { sent: d("sent"), landed: d("landed"), failed: d("failed"), expired: d("expired"), refused: d("refused") },
+      unknownTokens: (rt.executor.lastReconcile?.unknownTokens ?? []).map((t) => t.mint),
+      emptyTokenAccounts: rt.executor.lastReconcile?.emptyAccounts ?? 0,
+    };
+    lastLiveCounters = now;
+    return section;
+  }
+
   // ---- Digest (section 10), sent even if nothing happened (doubles as a heartbeat) ----
   // immediate: false — see runLoop's comment: the first digest waits a full
   // window instead of firing at startup, so it doesn't zero funnel counters
@@ -1241,16 +1571,38 @@ async function main(): Promise<void> {
     { immediate: false },
   );
 
-  logger.info("Trader running (Phase 2: paper trading)", { mode: config.MODE, pollSeconds: config.jupiter.effectivePollSeconds });
+  // ---- Live: wallet balances and the SOL reserve (section 16.7), every 60 s ----
+  if (live) {
+    void runLoop("live-wallet", 60_000, logger, signal, async () => {
+      await live.executor.readWalletBalances();
+    }, { immediate: false });
+  }
 
+  logger.info(`Trader running (${config.MODE} mode)`, { mode: config.MODE, pollSeconds: config.jupiter.effectivePollSeconds });
+
+  // The shutdown coordinator (section 16.11) waits for in-flight work, persists state, closes the database and exits.
   await new Promise<void>((resolve) => {
     signal.addEventListener("abort", () => resolve());
   });
-  db.close();
-  logger.info("Shutdown complete");
 }
 
+// SPEC.md section 16.9: nothing leaves the process unscrubbed, including fatal errors.
+function printFatal(label: string, err: unknown): void {
+  const text = err instanceof Error ? `${err.name}: ${err.message}
+${err.stack ?? ""}` : String(err);
+  console.error(`${label}: ${scrubFatal(text)}`);
+}
+process.on("uncaughtException", (err) => {
+  printFatal("Uncaught exception", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  // Same outcome as Node's default (crash; pm2 restarts it), but scrubbed.
+  printFatal("Unhandled rejection", err);
+  process.exit(1);
+});
+
 main().catch((err) => {
-  console.error("Fatal error during startup:", err);
+  printFatal("Fatal error during startup", err);
   process.exit(1);
 });

@@ -71,6 +71,20 @@ export interface DigestInput {
     deferredEntryChecks: number;
     downtimeGaps: Array<{ from: number; to: number }>;
   };
+  /** Section 16.5: reconciled closes with unknown proceeds, listed separately (not in the trading-day stats). */
+  proceedsUnknownTrades?: ClosedTradeSummary[];
+  /** Live mode only (section 10). */
+  live?: LiveDigestSection;
+}
+
+export interface LiveDigestSection {
+  sellFeeReserveSol: number;
+  closingPositions: Array<{ symbol: string; stuckState: string | null; sellAttempts: number; sellFeesLamports: number }>;
+  feeLossesToday: { count: number; usd: number };
+  rpcRequests: number;
+  tx: { sent: number; landed: number; failed: number; expired: number; refused: number };
+  unknownTokens: string[];
+  emptyTokenAccounts: number;
 }
 
 function topSkipReasons(skipReasons: Partial<Record<GateCheckId, number>>, limit = 3): string {
@@ -96,6 +110,7 @@ export function buildDigest(input: DigestInput): string {
   lines.push(`=== Trader digest (${input.mode}) ===`);
   lines.push(`Uptime: ${formatDurationMs(input.now - input.startedAt)}`);
   lines.push(`Wallet: $${input.walletUsdc.toFixed(2)} USDC, ${input.walletSol.toFixed(4)} SOL`);
+  if (input.live) lines.push(`SELL_FEE_RESERVE_SOL: ${input.live.sellFeeReserveSol.toFixed(6)} SOL`);
   if (input.solPriceUsd !== null) lines.push(`SOL/USD: $${input.solPriceUsd.toFixed(2)}`);
   lines.push("");
 
@@ -106,6 +121,10 @@ export function buildDigest(input: DigestInput): string {
     for (const t of input.tradesClosed) {
       lines.push(`  ${t.symbol}: ${t.exitReason}, ${fmtPct(t.netPnlPct)} (${fmtUsd(t.netPnlUsd)})`);
     }
+  }
+  if (input.proceedsUnknownTrades && input.proceedsUnknownTrades.length > 0) {
+    lines.push("Closed with proceeds unknown (reconciled; the loss may not be real):");
+    for (const t of input.proceedsUnknownTrades) lines.push(`  ${t.symbol}: recorded ${fmtUsd(t.netPnlUsd)}`);
   }
   lines.push("");
 
@@ -118,6 +137,12 @@ export function buildDigest(input: DigestInput): string {
       lines.push(
         `  ${p.symbol}: held ${formatDurationMs(p.timeHeldMs)}, pnl ${fmtPct(p.pnlPct)}, target ${p.currentTarget.toFixed(1)}%, deadline in ${deadlineIn}`,
       );
+    }
+  }
+  if (input.live && input.live.closingPositions.length > 0) {
+    lines.push("Closing / stuck positions:");
+    for (const p of input.live.closingPositions) {
+      lines.push(`  ${p.symbol}: ${p.stuckState ?? "closing"}, sell attempts ${p.sellAttempts}, fees spent ${(p.sellFeesLamports / 1e9).toFixed(6)} SOL`);
     }
   }
   lines.push("");
@@ -135,6 +160,7 @@ export function buildDigest(input: DigestInput): string {
   }
   const exitBreakdown = Object.entries(input.tradingDay.exitReasonBreakdown);
   lines.push(`  exit reasons: ${exitBreakdown.length > 0 ? exitBreakdown.map(([r, c]) => `${r}=${c}`).join(", ") : "none"}`);
+  if (input.live) lines.push(`  fee losses from failed transactions: ${input.live.feeLossesToday.count}, ${fmtUsd(-input.live.feeLossesToday.usd)}`);
   lines.push("");
 
   lines.push("Funnel:");
@@ -167,9 +193,21 @@ export function buildDigest(input: DigestInput): string {
       `peak ${input.health.jupiterRequestsPerMinPeak}, 429s: ${input.health.jupiter429s}`,
   );
   lines.push(`  Deferred entry checks: ${input.health.deferredEntryChecks}`);
+  if (input.live) {
+    const tx = input.live.tx;
+    lines.push(`  RPC requests this window: ${input.live.rpcRequests}`);
+    lines.push(`  Transactions: sent ${tx.sent}, landed ${tx.landed}, failed ${tx.failed}, expired ${tx.expired}; verification refusals ${tx.refused}`);
+  }
   if (input.health.downtimeGaps.length > 0) {
     const gaps = input.health.downtimeGaps.map((g) => formatDurationMs(g.to - g.from)).join(", ");
     lines.push(`  Downtime gaps this period: ${gaps}`);
+  }
+
+  if (input.live) {
+    lines.push("");
+    lines.push("Wallet reconciliation:");
+    lines.push(`  unknown tokens (never traded automatically): ${input.live.unknownTokens.length > 0 ? input.live.unknownTokens.join(", ") : "none"}`);
+    lines.push(`  empty token accounts left open: ${input.live.emptyTokenAccounts}`);
   }
 
   return lines.join("\n");

@@ -20,6 +20,8 @@ export interface TelegramClientOptions {
   logger: Logger;
   fetchImpl?: typeof fetch;
   baseUrl?: string;
+  /** Applied to every outgoing message (the logger's redaction, SPEC.md section 16.9). */
+  scrubText?: (text: string) => string;
 }
 
 /**
@@ -36,7 +38,7 @@ export class TelegramClient {
       await fetchJson(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: this.opts.chatId, text }),
+        body: JSON.stringify({ chat_id: this.opts.chatId, text: this.opts.scrubText ? this.opts.scrubText(text) : text }),
         timeoutMs: this.opts.timeoutMs ?? 8000,
         retries: 1,
         ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),

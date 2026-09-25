@@ -1,6 +1,6 @@
 # Solana Trader Bot: Build Spec v1
 
-Last updated: 2026-09-24. This file is the single source of truth for the trader bot. If anything here is ambiguous, contradicts itself, or doesn't match the current external docs, stop and ask instead of guessing.
+Last updated: 2026-09-25. This file is the single source of truth for the trader bot. If anything here is ambiguous, contradicts itself, or doesn't match the current external docs, stop and ask instead of guessing.
 
 ## 0. Purpose and scope
 
@@ -29,10 +29,11 @@ It is not part of the Cloudflare Worker in `../trends`. Never modify anything in
 ## 2. Modules
 
 - **config**: loads and validates `.env` (section 13); refuses to start on invalid values; warns on unknown keys.
-- **logger**: console plus rotating file at `LOG_LEVEL`, with secret redaction.
+- **logger**: console plus rotating file at `LOG_LEVEL`, with secret redaction (section 16.9).
 - **storage**: SQLite with versioned migrations (section 12).
-- **limiters**: DexScreener (profiles and pairs classes), Jupiter (two priority lanes, section 9.3), RPC.
+- **limiters**: DexScreener (profiles and pairs classes), Jupiter (two priority lanes, section 9.3), RPC (transaction lane ahead of read lane, plus a separate `sendTransaction` limiter; section 16.10).
 - **clients**: DexScreener, Jupiter, Solana RPC, Telegram.
+- **live** (Phase 3): key loading, transaction building, verification, sending, confirmation, write-ahead intents and reconciliation (section 16). Loaded only in live mode and by `smoke-live`.
 - **discovery**: profile polling and the pending queue (section 4).
 - **gate**: entry checks (section 5).
 - **selection**: scoring and slot filling (section 6).
@@ -56,12 +57,14 @@ It is not part of the Cloudflare Worker in `../trends`. Never modify anything in
 
 ### Jupiter
 
-- Free API key (`JUPITER_API_KEY`); the free plan allows 1 request per second. Read the current docs at developers.jup.ag and choose endpoints that support (a) quotes for arbitrary amounts without executing, and (b) in Phase 3, building or executing swaps.
+- Free API key (`JUPITER_API_KEY`); the free plan allows 1 request per second (60 per 60-second sliding window, per organisation). Read the current docs at developers.jup.ag and choose endpoints that support (a) quotes for arbitrary amounts without executing, and (b) in Phase 3, building or executing swaps.
 - In your plan, state which endpoints you chose, which rate-limit buckets they use (some execute/submit endpoints may have separate buckets), and any fees they charge. Those fees must be included in PnL.
+- Chosen (verified 2026-09-25): quotes use `GET /swap/v1/quote` in both modes (section 16.1); live swaps use the Router path `GET /swap/v2/build`, which returns raw instructions that the bot assembles, simulates, signs and sends through its own RPC. Both are in the main rate-limit bucket. `/build` charges no Jupiter swap fee.
 
 ### Solana RPC
 
-- `SOLANA_RPC_URL`, a keyed provider URL (for example Helius's free plan). Phases 1-2 only make read calls: `getAccountInfo` (jsonParsed), `getTokenLargestAccounts`, `getTokenSupply`, `getMultipleAccounts`. Limited by `RPC_MAX_RPS`.
+- `SOLANA_RPC_URL`, a keyed provider URL (for example Helius's free plan: 10 requests/s overall, `sendTransaction` 1/s, `simulateTransaction` shares the overall limit, 1M credits/month). Phases 1-2 only make read calls: `getAccountInfo` (jsonParsed), `getTokenLargestAccounts`, `getTokenSupply`, `getMultipleAccounts`. Limited by `RPC_MAX_RPS`.
+- Phase 3 adds, in live mode and `smoke-live` only: `simulateTransaction`, `sendTransaction`, `getSignatureStatuses`, `getTransaction`, `getBlockHeight`, `getLatestBlockhash`, `getTokenAccountsByOwner`. Budgets and limits are in section 16.10.
 
 ### Telegram
 
@@ -116,7 +119,7 @@ While open positions < `MAX_CONCURRENT` and no entry blocker is active (section 
 
 1. Take the READY mint with the highest score that is ≥ `MIN_SCORE` (tie-break: earlier `firstEligibleAt`). Skip mints with an entry already in flight.
 2. **Sellability** (Jupiter entry lane; result cached per mint for 10 minutes): quote USDC→token for the position size, then token→USDC for the quoted token amount. Require the round-trip output ≥ (1 − `MAX_ROUNDTRIP_LOSS_PCT`/100) × input. Failure is permanent (`unsellable`); move to the next mint.
-3. **Drift**: get the execution quote. Implied entry price = size / tokensOut. If it exceeds DexScreener `priceUsd` × (1 + `MAX_ENTRY_DRIFT_PCT`/100), skip (`drift`, temporary: the mint stays READY until its window expires).
+3. **Drift**: get the execution quote (in live mode, the `/swap/v2/build` response for the actual buy is the execution quote, so no separate quote call is made; section 16.2). Implied entry price = size / tokensOut. If it exceeds DexScreener `priceUsd` × (1 + `MAX_ENTRY_DRIFT_PCT`/100), skip (`drift`, temporary: the mint stays READY until its window expires).
 4. Open the position (section 7).
 
 Never close an open position to make room for a candidate.
@@ -124,7 +127,7 @@ Never close an open position to make room for a candidate.
 ## 7. Opening positions and fills
 
 - Size = min(`POSITION_USD`, liquidity_usd × `MAX_POSITION_PCT_OF_LIQ`/100).
-- Wallet check: available USDC ≥ size. Paper mode uses a virtual wallet seeded with `PAPER_STARTING_USDC` and `PAPER_STARTING_SOL`; live mode uses real balances (section 16).
+- Wallet check: available USDC ≥ size. Paper mode uses a virtual wallet seeded with `PAPER_STARTING_USDC` and `PAPER_STARTING_SOL`; live mode uses real on-chain balances and also checks SOL (section 16.7).
 - **Paper entry fill**: wait `PAPER_LATENCY_SEC`, fetch a fresh quote, tokens = quoteOut × (1 − `PAPER_EXTRA_SLIPPAGE_PCT`/100). Cost basis = size + `PAPER_FEE_USD_PER_TX`. Debit the virtual wallet.
 - **Paper exit fill**: wait `PAPER_LATENCY_SEC`, fetch a fresh sell quote, proceeds = quoteOut × (1 − `PAPER_EXTRA_SLIPPAGE_PCT`/100) − `PAPER_FEE_USD_PER_TX`. Credit the virtual wallet.
 - Live fills: section 16.
@@ -134,7 +137,7 @@ Never close an open position to make room for a candidate.
 
 ### 8.1 Loops
 
-- Every `POLL_SECONDS` per open position: Jupiter sell quote for the full token amount (exit lane). `valueUsd` = quoteOut − estimated exit fee (`PAPER_FEE_USD_PER_TX` in paper; priority + base fee in USD in live). `pnlPct` = (valueUsd − costBasis) / costBasis × 100. Immediately after the entry fill, one exit-lane quote is fetched the same way and its `pnlPct` becomes the first history point and the initial peak PnL — never assumed to be 0% (round-trip fees, price impact and simulated slippage typically put a just-opened position slightly below zero already). If that quote fails, no history point is fabricated; history starts empty and the first regular poll becomes history's first point.
+- Every `POLL_SECONDS` per open position: Jupiter sell quote for the full token amount (exit lane). `valueUsd` = quoteOut − estimated exit fee (`PAPER_FEE_USD_PER_TX` in paper; in live, (base fee + `MAX_PRIORITY_FEE_SOL`) in USD, plus the token account's reclaimable rent in USD when `CLOSE_EMPTY_ATA=true`, since the sell closes that account and the rent was included in the cost basis; section 16.3). In live mode the quoted amount is the token account's raw on-chain balance as last read from the chain (the confirmed entry, then every sell attempt's balance read and reconciliation); monitoring doesn't add a balance read per poll. `pnlPct` = (valueUsd − costBasis) / costBasis × 100. Immediately after the entry fill, one exit-lane quote is fetched the same way and its `pnlPct` becomes the first history point and the initial peak PnL — never assumed to be 0% (round-trip fees, price impact and simulated slippage typically put a just-opened position slightly below zero already). If that quote fails, no history point is fabricated; history starts empty and the first regular poll becomes history's first point.
 - Every `LIQ_CHECK_SECONDS`: DexScreener pair data for all held mints (batched); pass the latest `liquidity.usd` into the state machine as a new reading.
 
 ### 8.2 Persisted state per position
@@ -163,12 +166,12 @@ Evaluate in this order; the first SELL, NEED_CONFIRM or explicit HOLD returns:
 ### 8.4 Selling
 
 - Once a SELL is decided, the position's status becomes `closing` and the state machine no longer runs for it.
-- Paper: exit fill (section 7). Live: section 16. Then record the trade (section 11.1), start post-exit tracking, and run slot filling.
-- Paper mode with no route: keep trying every poll; if there's still no route after `STUCK_WRITE_OFF_MIN`, close at −100% with reason `written_off`.
+- Paper: exit fill (section 7). Live: section 16.6. Then record the trade (section 11.1), start post-exit tracking, and run slot filling.
+- Paper mode with no route: keep trying every poll; if there's still no route after `STUCK_WRITE_OFF_MIN`, close at −100% with reason `written_off`. Live mode never writes off a position whose tokens are still in the wallet (section 16.6).
 
 ### 8.5 Restarts
 
-On startup, reload open positions and resume polling. Times are absolute, so positions past their deadline or max hold sell on the first poll. Log the downtime gap. History older than the fast window is ignored.
+On startup, reload open positions and resume polling. In live mode, write-ahead intents are resolved and reconciliation runs first (section 16.5). Times are absolute, so positions past their deadline or max hold sell on the first poll. Log the downtime gap. History older than the fast window is ignored.
 
 ## 9. Risk and controls
 
@@ -176,38 +179,42 @@ On startup, reload open positions and resume polling. Times are absolute, so pos
 
 Checked before every entry. Open positions are always managed normally, whatever the blockers.
 
+**Per-mode accounting**: daily loss, the loss streak and its pause, and the digest's trading-day stats count only trades, positions and fee losses in the current `MODE`. Paper trades never affect live limits, and live trades never affect paper limits. The state keys for the daily-loss halt, loss streak and loss pause are stored per mode.
+
 - **Kill switch or pause** active.
-- **Daily loss**: realized net PnL for the trading day + Σ min(0, value − costBasis) over open positions ≤ −`MAX_DAILY_LOSS_USD` → halt entries until the next trading day (one urgent alert). `/resume` cannot clear this.
-- **Loss streak**: after `CONSECUTIVE_LOSS_PAUSE` losing trades in a row, pause entries for `LOSS_PAUSE_MINUTES` (noted in the digest).
+- **Daily loss**: realized net PnL for the trading day + realized fee losses for the trading day (section 16.3; live only) + Σ min(0, value − costBasis) over open positions ≤ −`MAX_DAILY_LOSS_USD` → halt entries until the next trading day (one urgent alert). `/resume` cannot clear this.
+- **Loss streak**: after `CONSECUTIVE_LOSS_PAUSE` losing trades in a row, pause entries for `LOSS_PAUSE_MINUTES` (noted in the digest). Fee losses from failed transactions are not trades and don't count toward the streak.
 - **Errors**: after `MAX_CONSECUTIVE_ERRORS` consecutive failed entries or unhandled loop errors, halt entries until `/resume` (urgent alert). 429 responses never count as errors.
 - **Slots**: open positions < `MAX_CONCURRENT`.
 
 ### 9.2 Controls
 
-- **Kill switch**: a file named `KILL` in the working directory, or `/killswitch`. Stops entries and sells all open positions (paper: closes the virtual ones). Persists across restarts.
+- **Kill switch**: a file named `KILL` in the working directory, or `/killswitch`. Stops entries and sells all open positions (paper: closes the virtual ones; live: real sells under section 16.6). Persists across restarts.
 - `/pause` stops new entries only. `/resume` clears pause, error halts, and the kill switch (the `KILL` file must also be deleted if it was used).
 
 ### 9.3 Jupiter budget
 
 - One limiter: at most `JUPITER_MAX_REQ_PER_MIN` in any 60-second sliding window, and at least `JUPITER_MIN_INTERVAL_MS` between requests.
-- Track `exitUsed` and `entryUsed` separately over the 60-second window. **Exit lane** (position sell quotes, confirmation quotes, exit fills, live sells and retries) always goes first and is never blocked by entry usage. **Entry lane** (sellability, execution quotes, entry fills) is allowed only if `exitUsed + entryUsed + max(0, exitReserve − exitUsed) < JUPITER_MAX_REQ_PER_MIN`, where `exitReserve = MAX_CONCURRENT × ceil(60 / POLL_SECONDS) + EXIT_RESERVE_EXTRA_PER_MIN`.
-- **Startup validation**: `exitReserve + ENTRY_MIN_BUDGET_PER_MIN` must be ≤ `JUPITER_MAX_REQ_PER_MIN`. If not, refuse to start with a clear message, or, if `AUTO_STRETCH_POLL=true`, raise `POLL_SECONDS` until it fits and log it.
+- Track `exitUsed` and `entryUsed` separately over the 60-second window. **Exit lane** (position sell quotes, confirmation quotes, the entry valuation quote, exit fills, live sell `/swap/v2/build` calls and their retries and rebuilds, `smoke-live`) always goes first and is never blocked by entry usage. **Entry lane** (sellability, execution quotes, paper entry fills, live buy `/swap/v2/build` calls) is allowed only if `exitUsed + entryUsed + max(0, exitReserve − exitUsed) < JUPITER_MAX_REQ_PER_MIN`, where `exitReserve = MAX_CONCURRENT × ceil(60 / P) + EXIT_RESERVE_EXTRA_PER_MIN`, with `P = POLL_SECONDS` in paper mode and `P = min(POLL_SECONDS, SELL_RETRY_SECONDS)` in live mode (a closing position retries its sell every `SELL_RETRY_SECONDS` instead of being polled).
+- **Startup validation**: `exitReserve + ENTRY_MIN_BUDGET_PER_MIN` must be ≤ `JUPITER_MAX_REQ_PER_MIN`. If not, refuse to start with a clear message, or, if `AUTO_STRETCH_POLL=true`, raise `POLL_SECONDS` until it fits and log it (in live mode, if `SELL_RETRY_SECONDS` is what doesn't fit, refuse to start: sell retries are never stretched automatically). Live mode also validates the RPC budget (section 16.10).
 - On a 429: back off with jitter; never retry faster than the limiter allows.
 - Count entry checks deferred for lack of budget (digest).
 
 ## 10. Notifications
 
 - No per-token, per-entry, per-exit or per-skip messages.
-- **Digest** every `DIGEST_INTERVAL_MINUTES`, sent even if nothing happened (it doubles as a heartbeat), labeled PAPER or LIVE:
-  - uptime and wallet balances (virtual in paper mode)
+- **Digest** every `DIGEST_INTERVAL_MINUTES`, sent even if nothing happened (it doubles as a heartbeat), labeled PAPER or LIVE. Every trade-based figure counts only the current mode (section 9.1):
+  - uptime and wallet balances (virtual in paper mode; on-chain USDC and SOL in live mode, plus `SELL_FEE_RESERVE_SOL`)
   - trades closed in the window: symbol, exit reason, net PnL % and USD
-  - open positions: symbol, time held, current PnL %, current target, deadline
-  - trading day so far: trades, win rate, median and mean net PnL, total, biggest win and loss, exit-reason breakdown
+  - open positions: symbol, time held, current PnL %, current target, deadline; in live mode also closing/stuck positions with sell attempts and fees spent
+  - trading day so far: trades, win rate, median and mean net PnL, total, biggest win and loss, exit-reason breakdown; in live mode also fee losses from failed transactions (count and USD)
   - funnel: discovered, eligible, READY, entered, top 3 skip reasons, skipped because slots were full, score range of entries
   - risk: pause/halt/kill state, daily loss vs cap, current loss streak
-  - health: Jupiter requests/min (average and peak), 429s, deferred entry checks, DexScreener and RPC errors, downtime gaps
-- **Urgent** messages go out immediately when `URGENT_ALERTS=true` (otherwise they wait for the next digest): `no_route` or stuck sells, daily loss halt, error halt, kill switch, DexScreener/Jupiter/RPC unreachable for more than `OUTAGE_ALERT_MINUTES` (one message per outage plus one on recovery), and startup after a crash or restart.
-- **Commands** (configured chat only): `/status` (digest now), `/report` (section 11.4 summary), `/pause`, `/resume`, `/killswitch`.
+  - health: Jupiter requests/min (average and peak), 429s, deferred entry checks, DexScreener and RPC errors, downtime gaps; in live mode also RPC requests in the window, transactions sent/landed/failed/expired, verification refusals
+  - live mode: unknown tokens held with no database record (section 16.5), and empty token accounts left open
+- **Urgent** messages go out immediately when `URGENT_ALERTS=true` (otherwise they wait for the next digest): `no_route` or stuck sells, daily loss halt, error halt, kill switch, DexScreener/Jupiter/RPC unreachable for more than `OUTAGE_ALERT_MINUTES` (one message per outage plus one on recovery), and startup after a crash or restart. Live mode adds: a transaction refused by verification (section 16.2), a position's sell fee budget used up (section 16.6), SOL below `SELL_FEE_RESERVE_SOL` while positions are open (section 16.7; one message per episode plus one on recovery), a startup in live mode while the go-live checklist isn't met (section 16.8), and unknown tokens or recovered transactions found by reconciliation (section 16.5).
+- **Commands** (configured chat only): `/status` (digest now), `/report` (section 11.4 summary), `/pause`, `/resume`, `/killswitch`, and in live mode `/sellretry <mint prefix>` (section 16.6).
+- `proceeds_unknown` trades (section 16.5) are listed separately in the digest, not mixed into the trading-day stats.
 
 ## 11. Tracking and reporting
 
@@ -219,9 +226,12 @@ Also stored: tokens received at entry and the mint's decimals (if ever learned);
 
 A trade's `position_history` (section 8.2) is copied into `trade_history` (not deleted) when the position closes, so it survives past the position row's removal.
 
+Live trades also store: the entry and exit transaction signatures; the raw on-chain amounts from the confirmed transactions (USDC spent and tokens received at entry, tokens sold and USDC received at exit, as large-integer strings); network fees in lamports and USD for each side; rent paid at entry and reclaimed at exit, in lamports and USD; the SOL/USD price used for each conversion; the number of sell attempts; the fees of failed sell attempts; and a `proceeds_unknown` flag (true only for `reconciled` closes, section 16.5). The Jupiter quote amounts (`inAmount`/`outAmount`) are still stored for comparison, but cost basis and proceeds come only from the confirmed transactions (section 16.3).
+
 ### 11.2 Shadow positions (`SHADOW_ENABLED`)
 
 - Every mint gets a shadow position the first time it becomes READY, whether or not it's later bought. Shadows are marked `selected` when a real or paper position opens for that mint, and `unsellable` if the mint fails the sellability check (excluded from comparisons).
+- Each shadow records the mode of the run that created it, so the report compares shadows with trades of the same mode.
 - Shadows use the same size and a constant-product cost estimate. With liquidity L and reserve R = L/2 per side: entry price = priceUsd × (1 + size/R) × (1 + `SHADOW_POOL_FEE_PCT`/100) × (1 + `PAPER_EXTRA_SLIPPAGE_PCT`/100), and `PAPER_FEE_USD_PER_TX` is added to the cost basis. Value at price p and liquidity L' (R' = L'/2), with V = tokens × p: proceeds = V × R'/(R' + V) × (1 − `SHADOW_POOL_FEE_PCT`/100) × (1 − `PAPER_EXTRA_SLIPPAGE_PCT`/100) − `PAPER_FEE_USD_PER_TX`.
 - Shadows run the same exit state machine, priced from DexScreener batches every `SHADOW_POLL_SECONDS`, and never call Jupiter. For shadows, `confirmPnlPct` = `pnlPct` (no second quote), and a missing pair counts as no route. At most `SHADOW_MAX_OPEN` are open at once; count the ones skipped beyond that.
 
@@ -232,7 +242,7 @@ A trade's `position_history` (section 8.2) is copied into `trade_history` (not d
 
 ### 11.4 Report
 
-`npm run report -- [--mode paper|live] [--from YYYY-MM-DD] [--to YYYY-MM-DD]` and `/report`:
+`npm run report -- [--mode paper|live] [--from YYYY-MM-DD] [--to YYYY-MM-DD]` and `/report`. Paper and live results are never mixed: without `--mode`, every section below is printed once for paper and once for live (a mode with no trades says so); `/report` shows the current mode. Live sections also report fee losses from failed transactions (count, USD, per trading day), which count toward total net PnL and max drawdown, and list `proceeds_unknown` trades separately (section 16.5).
 
 `npm run report -- --trades [--mode paper|live] [--from YYYY-MM-DD] [--to YYYY-MM-DD]` prints full per-trade detail instead of aggregates: everything section 11.1 stores per trade, plus the first 5 `trade_history` points (t, pnlPct).
 
@@ -243,15 +253,17 @@ A trade's `position_history` (section 8.2) is copied into `trade_history` (not d
 - Shadows: selected vs unselected (count, win rate, median and mean net PnL, p10); shadow vs actual results for selected mints (how closely the shadow method matches real quotes).
 - Exited too early: share of trades whose post-exit price at +15/+60 exceeded the exit price, and by how much.
 - Skipped tokens: median +15/+60 price change by skip reason.
-- **Go-live checklist** (paper trades only), each PASS or FAIL: closed trades ≥ `GOLIVE_MIN_TRADES`; first-to-last trade span ≥ `GOLIVE_MIN_DAYS` days; median net PnL % > `GOLIVE_MIN_MEDIAN_PNL_PCT`; total net PnL USD > `GOLIVE_MIN_TOTAL_PNL_USD`; p10 net PnL % ≥ `GOLIVE_MIN_P10_PNL_PCT`; no positions currently stuck.
+- **Go-live checklist** (paper trades only), each PASS or FAIL: closed trades ≥ `GOLIVE_MIN_TRADES`; first-to-last trade span ≥ `GOLIVE_MIN_DAYS` days; median net PnL % > `GOLIVE_MIN_MEDIAN_PNL_PCT`; total net PnL USD > `GOLIVE_MIN_TOTAL_PNL_USD`; p10 net PnL % ≥ `GOLIVE_MIN_P10_PNL_PCT`; no positions currently stuck. The checklist is information only: it never blocks live mode (sections 15 and 16.8).
 
 ## 12. Storage
 
-SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `trade_history` (a closed trade's `position_history`, preserved rather than deleted), `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks, virtual wallet), `events`. The database files are gitignored.
+SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `trade_history` (a closed trade's `position_history`, preserved rather than deleted), `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks per mode, virtual wallet), `events`. Phase 3 adds `tx_intents` (write-ahead intents, section 16.5) and `fee_losses` (fees of failed transactions, section 16.3), and extends `positions`, `trades`, `shadows` and `safety_cache` with the live fields sections 11.1, 11.2 and 16 need (signatures, raw amounts, token program, token account, decimals, sell attempts, fees spent, stuck state). Every intent and fee-loss row stores its mode. The database files are gitignored.
 
 ## 13. Configuration (.env)
 
-All values are placeholders to tune. Ship this as `.env.example` with the secrets left blank. Comments go on their own lines. Startup validation also checks: the weights sum to 1.0; the Jupiter budget (section 9.3); and `POSITION_USD ≤ HARD_MAX_POSITION_USD` (a code constant, section 16).
+All values are placeholders to tune. Ship this as `.env.example` with the secrets left blank. Comments go on their own lines. Startup validation also checks: the weights sum to 1.0; the Jupiter budget (section 9.3); and `POSITION_USD ≤ HARD_MAX_POSITION_USD` (a code constant, section 16). In live mode it also checks the live interlocks (section 16.8), the RPC budget (section 16.10), `SELL_SLIPPAGE_BPS_START ≤ SELL_SLIPPAGE_BPS_MAX`, `STUCK_BACKOFF_SECONDS` values ≥ `SELL_RETRY_SECONDS`, `MAX_PRIORITY_FEE_SOL > 0`, and `SELL_FEE_BUDGET_SOL ≥ 3 × (base fee + MAX_PRIORITY_FEE_SOL)` so a position can always reach the stuck point before its budget runs out.
+
+`SELL_FEE_RESERVE_SOL` is **derived, not configured**: `MAX_CONCURRENT × 3 × (0.000005 + MAX_PRIORITY_FEE_SOL)`, i.e. every open position's worst-case fees for three failed on-chain sell attempts (the stuck point, section 16.6) at the priority-fee cap, with a 5,000-lamport base fee for our single signature. With the defaults below it is 0.004545 SOL. It is logged at startup and shown in the digest. Setting it in `.env` is an unknown-key warning.
 
 ```ini
 # ---- Mode ----
@@ -264,7 +276,8 @@ LOG_LEVEL=info
 # ---- Secrets (never commit, never log) ----
 SOLANA_RPC_URL=
 JUPITER_API_KEY=
-# Phase 3 only; leave empty in paper mode
+# Live mode and smoke-live only; must be empty in paper mode (startup refuses otherwise).
+# Base58 string (Phantom/Solflare "export private key") or a 64-number JSON array (solana-keygen file contents).
 WALLET_PRIVATE_KEY=
 TRADER_TELEGRAM_BOT_TOKEN=
 TRADER_TELEGRAM_CHAT_ID=
@@ -354,7 +367,10 @@ JUPITER_MIN_INTERVAL_MS=1100
 EXIT_RESERVE_EXTRA_PER_MIN=5
 ENTRY_MIN_BUDGET_PER_MIN=10
 AUTO_STRETCH_POLL=false
+# All RPC calls, including simulate and send (Helius free plan: 10/s)
 RPC_MAX_RPS=8
+# sendTransaction only, on top of RPC_MAX_RPS (Helius free plan: 1/s)
+RPC_SEND_MAX_RPS=1
 
 # ---- Paper mode ----
 PAPER_STARTING_USDC=500
@@ -376,7 +392,7 @@ DIGEST_INTERVAL_MINUTES=120
 URGENT_ALERTS=true
 OUTAGE_ALERT_MINUTES=10
 
-# ---- Go-live checklist ----
+# ---- Go-live checklist (information only; never blocks live mode) ----
 GOLIVE_MIN_TRADES=100
 GOLIVE_MIN_DAYS=7
 GOLIVE_MIN_MEDIAN_PNL_PCT=0
@@ -387,10 +403,19 @@ GOLIVE_MIN_P10_PNL_PCT=-20
 BUY_SLIPPAGE_BPS=300
 SELL_SLIPPAGE_BPS_START=300
 SELL_SLIPPAGE_BPS_MAX=2000
+# Hard cap per transaction: compute-unit price x compute-unit limit, excluding the base fee
 MAX_PRIORITY_FEE_SOL=0.0005
+# Jupiter computeUnitPricePercentile: medium, high, veryHigh, or 0-10000 (bps). Always clamped to MAX_PRIORITY_FEE_SOL.
+PRIORITY_FEE_PERCENTILE=high
 MIN_SOL_BALANCE=0.05
 CLOSE_EMPTY_ATA=true
 SELL_RETRY_SECONDS=10
+# Seconds between sell attempts once a position is stuck; the last value repeats
+STUCK_BACKOFF_SECONDS=30,60,120,300,600
+# Max SOL one position's sell attempts may spend on network fees before sending stops
+SELL_FEE_BUDGET_SOL=0.005
+TX_CONFIRM_POLL_SECONDS=2
+# SELL_FEE_RESERVE_SOL is derived, not set here: MAX_CONCURRENT x 3 x (0.000005 + MAX_PRIORITY_FEE_SOL)
 ```
 
 ## 14. Tests (mocked network, no real API calls)
@@ -427,8 +452,9 @@ SELL_RETRY_SECONDS=10
 - Report math and the go-live checklist on a small hand-checked dataset.
 
 ### Safety
-- No code path in Phases 1-2 can sign or send a transaction.
-- Secrets are redacted in logs, including the RPC URL's `api-key`.
+- No code path in Phases 1-2 can sign or send a transaction. From Phase 3: signing and sending vocabulary appears only under the live module, paper mode never loads the key and never reaches the send path (the send function throws if called), and the live module is loaded only when `MODE=live` or by `smoke-live`.
+- Secrets are redacted in logs, including the RPC URL's `api-key`, and the wallet key in every encoding (section 16.9).
+- Live-mode tests: section 16.12.
 
 ## 15. Build phases
 
@@ -443,21 +469,149 @@ Build: gate checks 5-8, selection and scoring, the virtual wallet, paper fills, 
 Done when: all section 14 tests for Phases 1-2 pass, and a short paper run opens and closes virtual positions, sends a digest, and produces a report.
 
 ### Phase 3: Live execution
-Build only after the paper go-live checklist passes. See section 16.
+Decision (2026-09-25): build Phase 3 now, while the paper go-live checklist is still being collected. The bot stays in paper mode (`MODE` defaults to `paper`). The user alone decides when to switch to live, with a small wallet holding limited funds, and doing so does not require the go-live checklist to pass. The checklist stays in the report as information; in live mode, startup logs a warning and sends a Telegram message if it isn't met, but doesn't block (section 16.8). See section 16.
 
-Done when: all tests pass, including the paper-mode send-path test, and the README documents `smoke-live` and going live.
+Done when: `npx tsc --noEmit` is clean and all existing and new tests pass (mocked network), including the paper-mode send-path test and the tests in section 16.12, and the README documents `smoke-live`, the key format, the pm2 configuration and going live.
 
 ## 16. Live execution (Phase 3)
 
-- `MODE=live` starts only if `LIVE_ACK=I_ACCEPT_REAL_LOSSES`, `WALLET_PRIVATE_KEY` is set, and `POSITION_USD ≤ HARD_MAX_POSITION_USD`, which is a constant in code (100), not an env var.
-- Load the key from `.env` and never log it. Show only the public address.
-- Before each entry: USDC ≥ size and SOL ≥ `MIN_SOL_BALANCE`.
-- Swaps go through Jupiter per the current docs. Buys use `BUY_SLIPPAGE_BPS`. Priority fees are capped at `MAX_PRIORITY_FEE_SOL` per transaction.
-- **Verify before sending**: simulate every transaction and refuse it (with an urgent alert) unless the fee payer is our wallet and our wallet's only balance changes are the expected input mint decreasing (by no more than the expected amount plus slippage), the expected output mint increasing, and SOL spent on fees and token-account rent.
-- Confirm every transaction; on blockhash expiry, rebuild with a fresh quote.
-- Use the confirmed transaction's actual amounts for cost basis and proceeds, with all fees converted to USD.
-- **Sells**: retry every `SELL_RETRY_SECONDS` with a fresh quote and slippage rising from `SELL_SLIPPAGE_BPS_START` to `SELL_SLIPPAGE_BPS_MAX`. After 3 failures, mark the position `stuck`, send an urgent alert, and keep retrying.
-- After a full sell, close the empty token account (`CLOSE_EMPTY_ATA`) and credit the reclaimed rent.
-- **Startup reconciliation**: compare database positions with wallet token balances. Tokens held with no database record are reported in the digest and never traded automatically. Database positions with a zero balance close with reason `reconciled`.
-- `npm run smoke-live`: after the user types an explicit confirmation in the terminal, swap $1 of USDC → SOL → USDC to test signing, sending, confirmation and accounting. It never touches other tokens.
-- Tests: mocked end-to-end buy and sell; slippage escalation; stuck handling; simulation verification rejecting an unexpected balance change; reconciliation; the interlocks; and a test proving paper mode never reaches the send path.
+Requirements A1-A15 (added 2026-09-25) are folded into the subsections below and tagged. Where they conflicted with this section's earlier text, they won and the earlier text was rewritten.
+
+Constants in code, not env vars: `HARD_MAX_POSITION_USD` = 100; base fee = 5,000 lamports per signature (every bot transaction has exactly one signature, ours); compute-unit limit maximum = 1,400,000; failed attempts before a sell is stuck = 3; shutdown wait bound = 120 seconds; `smoke-live` size = 1 USDC.
+
+### 16.1 Jupiter endpoints (A1)
+
+- Live swaps use Jupiter's Swap API V2 Router path: `GET https://api.jup.ag/swap/v2/build` with `inputMint`, `outputMint`, `amount` (raw units), `taker` (our wallet), `slippageBps`, `computeUnitPricePercentile` = `PRIORITY_FEE_PERCENTILE`, and `wrapAndUnwrapSol=true`, and no `tipAmount`. It returns the quote (`inAmount`, `outAmount`, `otherAmountThreshold`), raw instructions, address lookup tables, and a recent blockhash with its `lastValidBlockHeight`. The bot assembles a v0 transaction from them, simulates it, verifies it (16.2), signs it and sends it through `SOLANA_RPC_URL`. Jupiter charges no swap fee on `/build`; the only costs are Solana network fees (base + priority) and token-account rent. Buys use `BUY_SLIPPAGE_BPS`.
+- Not used: the Meta-Aggregator path (`GET /swap/v2/order` + `POST /swap/v2/execute`). It lands transactions better (Jupiter's own landing pipeline, real-time slippage, competing routers including RFQ market makers), but Jupiter assembles the transaction and it can't be modified, RFQ fills are co-signed by the market maker after we sign (so the bytes we simulate are not the bytes that land), Jupiter chooses the priority fee, and it charges a platform fee of 10 bps on most pairs and 50 bps on tokens less than 24 hours old, which is most of what this bot trades. Also not used: `tx.jup.ag` (Jupiter's landing for self-built transactions), which requires a 0.001 SOL tip per transaction, above the default priority-fee cap.
+- Tradeoff accepted: landing depends on our RPC and our capped priority fee, so under congestion some transactions expire unlanded. An expired transaction costs nothing; the bot resends the same signed bytes until expiry and then rebuilds (16.4).
+- Quote-only calls (sellability, monitoring, stop-loss confirmation, the entry valuation) keep using `GET /swap/v1/quote` in both modes, so paper and live PnL marks stay comparable. Both endpoints use Jupiter's Metis routing. Decision (2026-09-25): keep `/swap/v1/quote` for quotes in both modes. Jupiter's docs describe `/swap/v1` as the source of a migration to `/swap/v2/build`; if it is withdrawn, that needs a new decision (for paper mode too, because `/build` requires a `taker`).
+
+### 16.2 Building, simulating and verifying every transaction (A9)
+
+Every transaction the bot signs (buys, sells, `smoke-live` legs) goes through these steps. A transaction is only ever sent as the exact bytes that passed verification.
+
+1. **Check the Jupiter response**: `inputMint`, `outputMint` and `inAmount` match the request, `otherAmountThreshold` is present, and there is no `tipInstruction`. For USDC input, the requested amount must be ≤ `HARD_MAX_POSITION_USD` × 10^6 raw units, independently of the expected amount (this catches decimal bugs).
+2. **Compute budget**: simulate once with a 1,400,000 compute-unit limit (`replaceRecentBlockhash=true`), then set the limit to ceil(1.2 × units consumed), capped at 1,400,000. Take the compute-unit price from Jupiter's `setComputeUnitPrice` instruction and lower it, if needed, so that ceil(price × limit / 10^6) ≤ `MAX_PRIORITY_FEE_SOL` in lamports.
+3. **Assemble** the v0 transaction: compute budget, Jupiter's setup instructions, the swap instruction, Jupiter's cleanup and other instructions, then (full sells only) the `closeAccount` instruction (16.6). The fee payer is our wallet.
+4. **Sign**, then **simulate the signed bytes** with `sigVerify=true`, `commitment=confirmed`, `innerInstructions=true`, and `accounts` set to our token accounts in the transaction (jsonParsed).
+5. **Refuse** unless every check passes (all amounts in raw units; "ours" = owned by our wallet):
+   - a. The fee payer is our wallet, and our wallet is the only required signer.
+   - b. The simulation has no error, and it returned `fee`, `preBalances`, `postBalances`, `preTokenBalances` and `postTokenBalances`. If the RPC omits any of the four balance fields, the **fallback** (`src/live/simFallback.ts`) supplies them: immediately before simulating, one `getMultipleAccounts` reads the pre-state of every writable account in the transaction (which includes our wallet, our token accounts, and every account the transaction will create); the simulation requests the post-state of the same accounts through `accounts` (jsonParsed); balances are derived from the two. The first time the RPC omits the fields, the transaction is simulated once more right after the pre-read; from then on (per process) the pre-read comes first. The fallback fails closed if any account is missing from either side, if the wallet isn't System-owned on both sides, if an account the transaction creates ends up owned by anything but Token/Token-2022, if a Token/Token-2022-owned account can't be parsed, or if the two sides are inconsistent (different account sets, a token account whose mint or owner changed). Residual race, documented: the pre-state is read one RPC round trip before the simulation runs, and state can change in between. An outgoing change (for example a token balance moving) usually makes a genuine transaction fail verification, which is safe. An incoming transfer to our wallet or token accounts in that window inflates the measured change and could hide an outflow of up to the same amount from the balance checks (d-g); the instruction-level checks (h, i) still catch explicit transfers from our wallet and authority changes, and the primary path (balances from the simulation itself) has no such window. `smoke-live`'s dry run prints which source was used (`simulation` or `fallback`).
+   - c. There is exactly one `setComputeUnitLimit` and one `setComputeUnitPrice`, priority fee = ceil(price × limit / 10^6) lamports ≤ `MAX_PRIORITY_FEE_SOL`, and the simulated `fee` equals 5,000 + that priority fee.
+   - d. Input: our balance of the input mint decreases by at most the requested amount. Swaps are ExactIn, so slippage applies only to the output. For USDC input, the simulated decrease is also ≤ `HARD_MAX_POSITION_USD` × 10^6.
+   - e. Output: our balance of the output mint increases by at least the quote's `otherAmountThreshold` (minimum out).
+   - f. No other token balance of ours changes, except the sold token account going to zero and being closed (full sells).
+   - g. SOL: our wallet's lamport change ≥ `minOutSol` + `rentReclaimed` − `fee` − `rentNew` − `solIn`, where `fee` is from check c; `rentNew` is the lamports held after the transaction by accounts that had none before and are token accounts we own; `rentReclaimed` is the lamports held before the transaction by our token accounts that it closes; `solIn` is the input amount when SOL is the input mint; and `minOutSol` is `otherAmountThreshold` when SOL is the output mint. A temporary wrapped-SOL account that is created and closed within the transaction counts as neither new nor reclaimed, so SOL received from a swap is never mistaken for fees or rent.
+   - h. No instruction, top-level or inner, transfers SOL from our wallet to anything except our own wrapped-SOL token account (wrapping SOL when SOL is the input). No instruction funds a new account other than a token account we own, or assigns our wallet to another program. No tips: `/build` is called without `tipAmount`, and we don't use a landing service that requires one.
+   - i. No instruction changes an owner, authority, delegate or close authority on any of our token accounts (`SetAuthority`, `Approve`, `ApproveChecked`), and in the simulated post-state every one of our token accounts has our wallet as owner, no delegate and no close authority.
+   - j. Every token account we own in the post-state holds USDC, wrapped SOL or the traded mint.
+6. **Fail closed** wherever the Jupiter response, the RPC or the docs give an unexpected shape. Top level allows exactly: the two compute-budget instructions; associated-token-account creation paid by and owned by our wallet, for USDC, wrapped SOL or the traded mint; a system transfer from our wallet only into our own wrapped-SOL account when SOL is the input; Token/Token-2022 `syncNative` on our wrapped-SOL account and `closeAccount` of our account to our wallet; and exactly one instruction of Jupiter's aggregator program (`JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4`; the Swap V2 docs don't print it, so smoke-live's dry run is where a mismatch would first show, as a refusal). Also refused: a missing or mistyped field, an instruction from a program or with a discriminator the verifier doesn't know how to judge (only the programs whose effects on our accounts are checked above are allowed at top level: compute budget, system, associated token, Token, Token-2022, and Jupiter's program for the swap instruction itself; inner instructions from other programs are allowed only because their effects appear in the balance and post-state checks), or a token account whose owner program is neither Token nor Token-2022. Each of these is a refusal.
+7. A refused transaction is never sent, costs no fee, and triggers an urgent alert naming the failed check. A refused buy counts as a failed entry (section 9.1 errors). A refused sell counts as a failed sell attempt (16.6). If one DEX keeps producing refused transactions (for example because it creates its own per-user accounts), the fix is to exclude it via `/build`'s `excludeDexes`, never to relax a check.
+
+### 16.3 Real fills, fees and rent (A2)
+
+- Cost basis and proceeds come from the confirmed transaction (`getTransaction`, jsonParsed, `maxSupportedTransactionVersion: 0`), never from the quote: token and USDC amounts from our pre/post token balances, the network fee from `meta.fee`, and rent from our wallet's lamport changes. All SOL amounts are converted to USD at the section 3 SOL/USD price at confirmation time; that price is stored with the trade. Live entries are blocked until a SOL/USD price has been fetched.
+- **Buy**: tokens = the increase in our token account; cost basis USD = USDC spent + (network fee + rent paid for the new token account) in USD.
+- **Sell**: proceeds USD = USDC received + (rent reclaimed − network fee) in USD. Net PnL = proceeds − cost basis.
+- **Fee losses**: a transaction that lands but fails on-chain still pays its network fee. That fee is recorded in `fee_losses` (mode, time, trading day, mint, position, signature, lamports, USD) as a realized loss. It counts in daily loss (section 9.1) and in the report's total net PnL and drawdown (section 11.4), but never in a trade's PnL, so nothing is counted twice. A trade stores the sum of its failed sell fees for information only. A transaction that expires unlanded pays no fee; it is counted in the digest's health section but adds no loss.
+
+### 16.4 Sending, confirmation and blockhash expiry (A8)
+
+- Before sending, persist the intent (16.5). Send with `sendTransaction` (base64, `skipPreflight=true` since the exact bytes were just simulated, `maxRetries=0`), and resend the same signed bytes every 2 × `TX_CONFIRM_POLL_SECONDS` until the transaction is confirmed, failed or expired. Resending identical bytes can't create a second transaction: it has the same signature.
+- Confirmation: every `TX_CONFIRM_POLL_SECONDS`, one `getSignatureStatuses` call covers every in-flight signature. `confirmed` or `finalized` with no error = landed; with an error = failed on-chain (fee paid, 16.3).
+- Expiry: once a status has stayed empty for 30 seconds, each poll also calls `getBlockHeight`. When the block height passes the intent's `lastValidBlockHeight`, call `getSignatureStatuses` once more with `searchTransactionHistory=true`. Only if the signature is still not found is the intent marked expired. Only then may a new transaction for that position and side be built: a sell's next attempt rebuilds with a fresh `/build`; a buy does not rebuild. The entry attempt ends and the mint stays READY, so any later entry repeats the section 6.2 checks with fresh quotes.
+- Never two live transactions for the same position and side (for buys: the same mint) at once. This is enforced by a partial unique index over every unresolved intent status (`pending`: reserved before building; `signed`: built, verified and signed but not yet sent; `sent`: sent, awaiting confirmation; `landed`: confirmed but not yet applied), and checked twice: before building and again before signing. A second attempt for the same position and side is refused while any of those intents exists.
+
+### 16.5 Write-ahead intents and startup reconciliation (A7)
+
+- **Intent**: a `pending` intent row reserves the position and side before anything is built; it becomes `signed` with the signature and signed bytes before anything is sent, then `sent`. A `pending` or `signed` intent that never reached the network (a refusal, an error, a crash) is resolved as `abandoned`: a `signed` one only after its `lastValidBlockHeight` has passed with its signature not found, since it can't be proven unsent before that. Before any transaction is sent, the bot has persisted a `tx_intents` row with: kind (`buy`, `sell`, `smoke`), mode, mint, position id (sells) or entry key (buys), side, signature (computed from the signed transaction), the signed transaction bytes (base64: public once sent, and needed to resend after a restart), `lastValidBlockHeight`, expected amounts (requested input, quoted output, minimum output), status, and timestamps. A buy intent also stores everything needed to build the position: size, liquidity, the entry pair snapshot, score and components, holder and safety results, token program and decimals.
+- **Resolution** runs on startup for every unresolved intent, and before any retry or rebuild for that position and side. It calls `getSignatureStatuses` with `searchTransactionHistory=true`:
+  - landed: apply it from `getTransaction` (below);
+  - failed on-chain: record the fee loss;
+  - not found, and block height past `lastValidBlockHeight`: expired;
+  - not found, and not yet past it: still in flight, so keep resending and confirming (16.4).
+- **Applying a landed buy** that has no position yet creates a normal managed position from the confirmed transaction and the stored snapshot, never an "unknown token". Entry time is the transaction's block time, and the exit state (section 8.2) starts from it, so deadlines stay absolute. An urgent message reports the recovery.
+- **Applying a landed sell** whose position is still open or closing closes it with its real proceeds (16.3) and the stored pending exit reason.
+- **Reconciliation** runs after intent resolution, at startup and whenever a live sell finds a zero balance. It compares live positions with the wallet's token accounts (`getTokenAccountsByOwner`, once for the Token program and once for Token-2022), ignoring USDC, SOL and wrapped SOL:
+  - Tokens held with no position and no intent are "unknown tokens": listed in the digest, one urgent message when first seen, never traded automatically.
+  - A position with a zero on-chain balance and no landed sell closes with reason `reconciled` and proceeds 0, and its trade is flagged `proceeds_unknown` (the loss may not be real: for example, the user sold manually). The report and the digest show `proceeds_unknown` trades separately from the other trades and exclude them from win rate, median, mean and percentile stats; they still count in total net PnL, drawdown and daily loss, conservatively.
+  - Nothing is closed as `reconciled` or reported as an unknown token while an unresolved intent exists for that position or mint; reconciliation skips it until the intent is resolved.
+  - A `reconciled` close does NOT count toward the loss streak (`CONSECUTIVE_LOSS_PAUSE`): it neither extends nor resets it, since it may not be a real loss. It still counts in daily loss (conservative).
+  - A position whose on-chain balance differs from the stored amount keeps running with the on-chain amount, and the difference is logged.
+  - Empty token accounts left open are counted in the digest.
+- Intents are never deleted; resolved ones stay for audit.
+
+### 16.6 Sells, retries, stuck positions and fee budget (A10, A11, A3)
+
+- **Amount (A11)**: every live sell, including kill-switch sells, sells the token account's on-chain balance, read right before `/build`, never the stored amount. A zero balance sends nothing and goes to reconciliation.
+- **Attempt n** (n = previous attempts that didn't land successfully, from 0): resolve any open intent for the position, read the balance, call `/build` on the exit lane with slippage min(`SELL_SLIPPAGE_BPS_MAX`, `SELL_SLIPPAGE_BPS_START` × 2^n), verify (16.2), send (16.4).
+- **Failed attempts**: no route from Jupiter, a simulation error or a verification refusal (nothing sent, no fee); a transaction that failed on-chain (fee paid and recorded); an expired transaction (no fee).
+- **Stuck**: after 3 failed attempts the position becomes `stuck`, with one urgent alert. Retries continue, but on the `STUCK_BACKOFF_SECONDS` schedule (default 30, 60, 120, 300, 600 seconds, then every 600) instead of every `SELL_RETRY_SECONDS`. Failed on-chain sells cost fees, and at 10-second intervals they would drain a small wallet's SOL within hours.
+- **Fee budget**: before each send, if the network fees already paid by this position's sell attempts plus this attempt's maximum (base fee + `MAX_PRIORITY_FEE_SOL`) would exceed `SELL_FEE_BUDGET_SOL`, nothing is sent, the position is marked `budget_exhausted`, and one urgent alert says so. After that, the bot only reads the position's on-chain balance on the last backoff interval (no Jupiter calls, no sends), so a manual sale is picked up by reconciliation. `/sellretry <mint prefix>` (configured chat only) grants the position one more `SELL_FEE_BUDGET_SOL` and resumes attempts on the backoff schedule. The prefix must match exactly one stuck live position (`stuck` or `budget_exhausted`); zero or several matches change nothing and the reply says why.
+- Live mode never writes off a position (section 8.4's `written_off` is paper-only): its tokens are still in the wallet.
+- **Closing the token account (A3)**: when `CLOSE_EMPTY_ATA=true` and the sell is for the full balance, the sell transaction ends with a `closeAccount` instruction for our token account (destination and owner: our wallet), built with the mint's own token program: Token or Token-2022, read from the mint account's owner (cached with the safety result). If simulation fails only because of the close (the account isn't empty after the swap), the attempt rebuilds once without it and the account is left open. The reclaimed rent is part of proceeds (16.3). Section 5 check 7 already rejects Token-2022 mints with transfer fees, so the swap moves exactly the input amount and leaves the account empty.
+
+### 16.7 Wallet checks and the sell fee reserve (A4)
+
+- Before each entry, on-chain balances read right before building: USDC ≥ size, and SOL − worst-case buy cost ≥ max(`MIN_SOL_BALANCE`, `SELL_FEE_RESERVE_SOL`), where worst-case buy cost = base fee + `MAX_PRIORITY_FEE_SOL` + 0.0025 SOL for new token-account rent. Verification (16.2 g) bounds the rent actually spent.
+- `SELL_FEE_RESERVE_SOL` (derived, section 13) is never spent on entries.
+- While any live position is open, SOL is read at least every 60 seconds and at every live balance read. If it drops below `SELL_FEE_RESERVE_SOL`, one urgent alert goes out per episode, plus one on recovery. Sells continue regardless.
+
+### 16.8 Interlocks, mode switching and smoke-live (A5)
+
+- `MODE=live` starts only if `LIVE_ACK=I_ACCEPT_REAL_LOSSES` exactly, `WALLET_PRIVATE_KEY` parses to a valid 64-byte key pair (16.9), `POSITION_USD ≤ HARD_MAX_POSITION_USD`, and the Jupiter and RPC budgets validate (section 9.3, 16.10). Every live USDC input is also checked against `HARD_MAX_POSITION_USD` at build and at verification (16.2).
+- Paper mode refuses to start if `WALLET_PRIVATE_KEY` is non-empty, never loads the key, and never loads the live module. The send function throws if it is ever reached outside live mode or `smoke-live --send`.
+- On a live start, if the paper go-live checklist (section 11.4) isn't met, startup logs a warning and sends a Telegram message listing the failed items, then continues. It never blocks.
+- Mode switching: startup refuses, listing the rows, while positions or unresolved intents of the other mode exist. Paper positions are virtual, and a live position must never be left unmanaged.
+- `npm run smoke-live`: the same interlocks as live mode, so it runs only from a folder configured for `MODE=live`. It refuses if the heartbeat in this folder's database is less than 2 minutes old (a bot running from this same folder). It can't see a bot running from another folder, so the paper bot must be stopped first (README). It never touches any token except USDC and SOL, and creates no positions or trades. Its transactions are intents of kind `smoke`, and its fees are printed in its output rather than counted in live limits.
+  - **Default: dry run.** Builds the $1 USDC → SOL leg (1,000,000 raw USDC) and the SOL → USDC leg for that quote's output, simulates and verifies both (16.2), and prints the verification results, the balance source used (`simulation` or `fallback`), and the fees each leg would pay. It never sends. The second leg is verified only if the wallet already holds that much SOL; otherwise the dry run says so.
+  - **`npm run smoke-live -- --send`**: prints the public address, the amounts and the maximum fees, then requires the user to type the confirmation phrase `send 1 usdc` in an interactive terminal (it refuses when stdin isn't a TTY). It then runs leg 1, confirms it, and measures the SOL actually received from the confirmed transaction. Leg 2 sells exactly that amount. It prints the full accounting: USDC in and out, each fee in SOL and USD, and the net cost.
+
+### 16.9 Private key and redaction (A6)
+
+- Accepted formats for `WALLET_PRIVATE_KEY`: a base58 string of the 64-byte secret key (what Phantom and Solflare export) or a JSON array of 64 numbers (the contents of a `solana-keygen` key file). Anything else refuses to start with a message that never echoes the value. The public half must match the key derived from the private half.
+- The key is read only in live mode and by `smoke-live`, after the redaction list has been extended with all its encodings. The decoded bytes are imported into a non-extractable signing key and then zeroed. The value is deleted from `process.env` and kept out of the config object, so no config dump can contain it.
+- Redaction covers log lines, Telegram messages, error messages and stack traces, the fatal/uncaught-exception handlers, and config errors. It scrubs the 64-byte key and its 32-byte private half in every encoding: base58, JSON array (any whitespace), comma-separated decimal bytes, base64, base64url, and hex (either case, with or without separators). Byte arrays (`Uint8Array`, `Buffer`) in log metadata are never printed.
+- Startup logs only the wallet's public address.
+
+### 16.10 Request budgets (A13)
+
+Requests per live trade, with default settings:
+
+| | Jupiter | RPC |
+|---|---|---|
+| Live buy | 2 sellability quotes (entry lane, cached 10 min per mint) + 1 `/swap/v2/build` (entry lane; it is also the drift check) + 1 valuation quote after the fill (exit lane) | 1 `getMultipleAccounts` (SOL + USDC balances), 2 `simulateTransaction`, 1 `sendTransaction` plus a resend every 4 s until landed, shared `getSignatureStatuses` polls (typically 1-5), `getBlockHeight` only after 30 s unconfirmed, 1 `getTransaction`. Typically about 8 calls. Worst case (expiry after about 90 s): about 100 calls spread over 90 s. |
+| Live sell attempt | 1 `/swap/v2/build` (exit lane) per attempt | The same as a buy; its `getMultipleAccounts` reads the token account's on-chain balance (A11) and SOL. |
+| Monitoring (both modes) | 1 quote per open position per `POLL_SECONDS` (exit lane), +1 for a stop-loss confirmation | none |
+
+When the simulation fallback (16.2 b) is used, each verification adds one `getMultipleAccounts` call.
+
+- RPC defaults assume the Helius free plan (10 requests/s overall, `sendTransaction` 1/s); `RPC_MAX_RPS=8` leaves a margin under the plan limit. Every rate limit is a config value, never hard-coded.
+- Every RPC call goes through `RPC_MAX_RPS`, and `sendTransaction` also through `RPC_SEND_MAX_RPS`. The RPC limiter has two lanes: transaction-lane calls (live balance reads, simulate, send, status, block height, `getTransaction`) are served before read-lane calls (gate checks, reconciliation) whenever both are waiting.
+- **Live startup validation**: `RPC_SEND_MAX_RPS ≥ 1`, and `RPC_MAX_RPS ≥ 2 / TX_CONFIRM_POLL_SECONDS + min(RPC_SEND_MAX_RPS, MAX_CONCURRENT / 4) + 2` (status and block-height polls, resends, and headroom for simulations and balance reads). With the defaults that is 3.75 ≤ 8. Otherwise refuse to start with a clear message. The section 9.3 Jupiter validation uses the live `exitReserve`.
+- An RPC 429 backs off with jitter and never counts as an error. The digest reports RPC calls per window so they can be checked against the provider's monthly quota (Helius free plan: 1M credits, 1 credit per standard call).
+
+### 16.11 Graceful shutdown (A14)
+
+- Triggers: `SIGINT` (Ctrl+C), `SIGTERM` (Linux), and a process `message` event with the value `shutdown`. On Windows, `pm2 stop` delivers no signal, so pm2 runs with `shutdown_with_message: true` and sends that message instead.
+- Sequence: stop new entries and new sell attempts; stop the loops; wait for in-flight transactions to confirm, fail or expire (their `lastValidBlockHeight` passes), still resending and confirming as usual, bounded by 120 seconds; wait for in-flight paper fills too; persist state and the heartbeat; close the database; exit 0. Intents still unresolved at the bound are resolved on the next start. Open, closing and stuck positions resume on the next start.
+- A second trigger during shutdown only logs that shutdown is in progress. pm2's `kill_timeout` is the hard bound.
+- The pm2 config is an `ecosystem.config.cjs` in the repo with `shutdown_with_message: true` and `kill_timeout: 150000` (above the 120-second bound). The README gives the exact commands to switch the running process to it.
+
+### 16.12 Tests (A15)
+
+Mocked network only; done when `npx tsc --noEmit` is clean and all existing and new tests pass. Required, in addition to section 14:
+
+- Mocked end-to-end live buy and sell, with cost basis and proceeds taken from the confirmed transaction's balance changes, not the quote, and fees and rent converted to USD.
+- Slippage escalation; stuck after 3 failures; the backoff schedule; the per-position fee budget stopping sends; simulation failure never sending; fee losses from failed transactions in daily loss and in the report.
+- Verification rejecting each case in 16.2 step 5, including an unexpected balance change, an owner or delegate change, SOL beyond fees and rent, a SOL transfer to another account, output below the minimum, a priority fee above the cap, and USDC input above `HARD_MAX_POSITION_USD` in raw units; and accepting SOL as the output mint (wrap and unwrap) without confusing it with fees.
+- Intents: an unrecorded landed buy becomes a managed position; an unrecorded landed sell closes with real proceeds; reconciliation ignores USDC and SOL, reports unknown tokens, and closes zero-balance positions as `reconciled`.
+- Blockhash expiry: no rebuild if the old signature landed; a rebuild only after confirmed expiry; never two live transactions for the same position and side.
+- Closing the token account under Token and under Token-2022.
+- The interlocks; paper mode never loading the key and never reaching the send path (the send function throws if called); the key never appearing in log output in any encoding; per-mode daily loss and loss streak.
+- Graceful shutdown with a transaction in flight, via `SIGINT` and via the pm2 `shutdown` message.
+- The one-transaction guard: an intent persisted but not yet sent (`pending` or `signed`) refuses a second attempt for the same position and side, both before building and before signing.
+- Reconciliation never closes a position as `reconciled`, and never reports its tokens as unknown, while an unresolved intent exists for it.
+- Fail closed on unexpected shapes: missing simulation fields (primary path and fallback), unknown instructions, unknown token programs; a refused transaction is never sent.
+- `/sellretry`: exactly one match required; configured chat only.
+- `proceeds_unknown` trades shown separately in the report and digest.
