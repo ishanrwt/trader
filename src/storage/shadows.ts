@@ -1,7 +1,10 @@
 import type { Db } from "./db.js";
 import type { ExitState, HistoryPoint } from "../monitor/stateMachine.js";
 
-export type ShadowOutcome = "open" | "selected" | "unsellable" | "closed";
+/** Lifecycle only (SPEC.md section 11.2): open shadows are polled until the exit state machine closes them. */
+export type ShadowOutcome = "open" | "closed";
+/** Classification, independent of lifecycle: selected shadows keep being priced until they close. */
+export type ShadowClassification = "unselected" | "selected" | "unsellable";
 
 export interface ShadowRow {
   id: number;
@@ -9,6 +12,7 @@ export interface ShadowRow {
   symbol: string | null;
   pairAddress: string | null;
   outcome: ShadowOutcome;
+  classification: ShadowClassification;
   entryTime: number;
   costBasis: number;
   tokenAmount: number;
@@ -37,7 +41,8 @@ export interface ShadowRow {
   duplicateOf?: number | null;
 }
 
-export type NewShadowRow = Omit<ShadowRow, "id" | "duplicateOf">;
+/** New shadows start unselected unless given a classification. */
+export type NewShadowRow = Omit<ShadowRow, "id" | "duplicateOf" | "classification"> & { classification?: ShadowClassification };
 export type ShadowPatch = Partial<Omit<ShadowRow, "id" | "mint" | "entryTime">>;
 
 interface ShadowRowDb {
@@ -46,6 +51,7 @@ interface ShadowRowDb {
   symbol: string | null;
   pair_address: string | null;
   outcome: string;
+  classification: string;
   entry_time: number;
   cost_basis: number;
   token_amount: number;
@@ -79,6 +85,7 @@ function fromDb(row: ShadowRowDb): ShadowRow {
     symbol: row.symbol,
     pairAddress: row.pair_address,
     outcome: row.outcome as ShadowOutcome,
+    classification: row.classification as ShadowClassification,
     entryTime: row.entry_time,
     costBasis: row.cost_basis,
     tokenAmount: row.token_amount,
@@ -136,10 +143,10 @@ export class ShadowsStore {
     return this.db
       .prepare(
         `INSERT INTO shadows (
-          mint, symbol, pair_address, outcome, entry_time, cost_basis, token_amount, entry_liquidity_usd, entry_price_usd,
+          mint, symbol, pair_address, outcome, classification, entry_time, cost_basis, token_amount, entry_liquidity_usd, entry_price_usd,
           score, score_components, peak_pnl, current_target, target_extensions, timer_restarts, last_restart_at,
           deadline, trail_armed, fast_streak, low_liq_streak, no_route_since, exit_time, exit_reason, proceeds, net_pnl_usd, net_pnl_pct, mode
-        ) VALUES (@mint, @symbol, @pair_address, @outcome, @entry_time, @cost_basis, @token_amount, @entry_liquidity_usd, @entry_price_usd,
+        ) VALUES (@mint, @symbol, @pair_address, @outcome, @classification, @entry_time, @cost_basis, @token_amount, @entry_liquidity_usd, @entry_price_usd,
           @score, @score_components, @peak_pnl, @current_target, @target_extensions, @timer_restarts, @last_restart_at,
           @deadline, @trail_armed, @fast_streak, @low_liq_streak, @no_route_since, @exit_time, @exit_reason, @proceeds, @net_pnl_usd, @net_pnl_pct, @mode)${onConflict}`,
       )
@@ -148,6 +155,7 @@ export class ShadowsStore {
         symbol: row.symbol,
         pair_address: row.pairAddress,
         outcome: row.outcome,
+        classification: row.classification ?? "unselected",
         entry_time: row.entryTime,
         cost_basis: row.costBasis,
         token_amount: row.tokenAmount,
@@ -185,13 +193,6 @@ export class ShadowsStore {
     return row ? fromDb(row) : undefined;
   }
 
-  getOpenByMint(mint: string): ShadowRow | undefined {
-    const row = this.db.prepare(`SELECT * FROM shadows WHERE mint = ? AND outcome = 'open' AND ${NOT_DUPLICATE} ORDER BY entry_time DESC LIMIT 1`).get(mint) as
-      | ShadowRowDb
-      | undefined;
-    return row ? fromDb(row) : undefined;
-  }
-
   listOpen(): ShadowRow[] {
     return (this.db.prepare(`SELECT * FROM shadows WHERE outcome = 'open' AND ${NOT_DUPLICATE} ORDER BY entry_time ASC`).all() as ShadowRowDb[]).map(fromDb);
   }
@@ -211,7 +212,7 @@ export class ShadowsStore {
     const next = { ...current, ...patch };
     this.db
       .prepare(
-        `UPDATE shadows SET symbol=@symbol, pair_address=@pair_address, outcome=@outcome, score=@score, score_components=@score_components,
+        `UPDATE shadows SET symbol=@symbol, pair_address=@pair_address, outcome=@outcome, classification=@classification, score=@score, score_components=@score_components,
           peak_pnl=@peak_pnl, current_target=@current_target, target_extensions=@target_extensions, timer_restarts=@timer_restarts,
           last_restart_at=@last_restart_at, deadline=@deadline, trail_armed=@trail_armed, fast_streak=@fast_streak,
           low_liq_streak=@low_liq_streak, no_route_since=@no_route_since, exit_time=@exit_time, exit_reason=@exit_reason,
@@ -223,6 +224,7 @@ export class ShadowsStore {
         symbol: next.symbol,
         pair_address: next.pairAddress,
         outcome: next.outcome,
+        classification: next.classification,
         score: next.score,
         score_components: next.scoreComponents ? JSON.stringify(next.scoreComponents) : null,
         peak_pnl: next.peakPnl,

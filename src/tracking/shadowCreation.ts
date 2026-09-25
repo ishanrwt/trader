@@ -75,3 +75,20 @@ export function createShadowOnReady(
   });
   return id === null ? "exists" : "created";
 }
+
+/**
+ * SPEC.md section 11.2: a position opened for the mint marks its shadow
+ * selected, whatever the shadow's lifecycle state (an open one keeps being
+ * priced; one that already closed is still classified). Unsellable wins:
+ * such a mint can't be bought anyway.
+ */
+export function markShadowSelected(store: ShadowsStore, mint: string, mode: string): void {
+  const shadow = store.getForMint(mint, mode);
+  if (shadow && shadow.classification !== "unsellable") store.update(shadow.id, { classification: "selected" });
+}
+
+/** SPEC.md section 11.2: a mint that fails the sellability check marks its shadow unsellable (excluded from comparisons). */
+export function markShadowUnsellable(store: ShadowsStore, mint: string, mode: string): void {
+  const shadow = store.getForMint(mint, mode);
+  if (shadow) store.update(shadow.id, { classification: "unsellable" });
+}

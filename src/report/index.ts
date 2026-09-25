@@ -21,6 +21,8 @@ export interface TradeRecord {
   proceedsUnknown?: boolean;
   /** Needed by the as-if-live replay (section 11.4). */
   entryTime?: number;
+  /** Needed to pair a selected shadow with its trade (section 11.4, shadow vs actual). */
+  mint?: string;
   /** Section 11.1: halts a live bot would have been blocked by at entry; null/undefined = not recorded. */
   wouldBlockAtEntry?: string | null;
 }
@@ -159,8 +161,12 @@ export function scoreComponentCorrelations(trades: readonly TradeRecord[]): Scor
   };
 }
 
+/** A shadow as the report sees it (section 11.2): lifecycle and classification are separate. Duplicates are never passed in. */
 export interface ShadowRecord {
-  outcome: "open" | "selected" | "unsellable" | "closed";
+  mint: string;
+  entryTime: number;
+  outcome: "open" | "closed";
+  classification: "unselected" | "selected" | "unsellable";
   netPnlUsd: number | null;
   netPnlPct: number | null;
 }
@@ -168,11 +174,24 @@ export interface ShadowRecord {
 export interface ShadowComparisonResult {
   selected: TotalsResult;
   unselected: TotalsResult;
+  /** Closed without PnL: shadows classified before the lifecycle fix were never priced (exit_reason 'not_priced'). */
+  noData: { selected: number; unselected: number };
+  /** Still being priced; not yet comparable. */
+  stillOpen: number;
+  /** Excluded from comparisons (section 11.2). */
+  unsellable: number;
 }
 
-/** SPEC.md section 11.4: shadows, selected vs unselected. Excludes "unsellable" (per section 11.2) and still-open shadows. */
+/**
+ * SPEC.md section 11.4: shadows, selected vs unselected, over closed shadows
+ * with PnL. Unsellable shadows are excluded; still-open and unpriced ("no
+ * data") shadows are counted, not compared.
+ */
 export function compareShadowsSelectedVsUnselected(shadows: readonly ShadowRecord[]): ShadowComparisonResult {
-  const closed = shadows.filter((s) => s.outcome === "selected" || s.outcome === "closed").filter((s) => s.netPnlUsd !== null);
+  const comparable = shadows.filter((s) => s.classification !== "unsellable");
+  const closed = comparable.filter((s) => s.outcome === "closed");
+  const priced = closed.filter((s) => s.netPnlUsd !== null);
+  const unpriced = closed.filter((s) => s.netPnlUsd === null);
   const asTrades = (list: readonly ShadowRecord[]): TradeRecord[] =>
     list.map((s) => ({
       mode: "paper",
@@ -191,8 +210,14 @@ export function compareShadowsSelectedVsUnselected(shadows: readonly ShadowRecor
       scoreComponents: null,
     }));
   return {
-    selected: computeTotals(asTrades(closed.filter((s) => s.outcome === "selected"))),
-    unselected: computeTotals(asTrades(closed.filter((s) => s.outcome === "closed"))),
+    selected: computeTotals(asTrades(priced.filter((s) => s.classification === "selected"))),
+    unselected: computeTotals(asTrades(priced.filter((s) => s.classification === "unselected"))),
+    noData: {
+      selected: unpriced.filter((s) => s.classification === "selected").length,
+      unselected: unpriced.filter((s) => s.classification === "unselected").length,
+    },
+    stillOpen: comparable.filter((s) => s.outcome === "open").length,
+    unsellable: shadows.length - comparable.length,
   };
 }
 
@@ -204,16 +229,39 @@ export interface ShadowVsActualPair {
 export interface ShadowVsActualResult {
   pairs: number;
   meanAbsDiffPct: number;
+  /** Mean of (shadow - actual): positive means the shadow method is optimistic. */
+  meanSignedDiffPct: number;
   correlation: number;
+}
+
+/**
+ * Pairs each selected shadow that has PnL with its mint's first trade that
+ * entered at or after the shadow (same mode: callers pass one mode's shadows
+ * and trades).
+ */
+export function pairShadowsWithTrades(
+  shadows: readonly ShadowRecord[],
+  trades: ReadonlyArray<{ mint?: string; entryTime?: number; netPnlPct: number }>,
+): ShadowVsActualPair[] {
+  const pairs: ShadowVsActualPair[] = [];
+  for (const s of shadows) {
+    if (s.classification !== "selected" || s.netPnlPct === null) continue;
+    const match = trades
+      .filter((t) => t.mint === s.mint && t.entryTime !== undefined && t.entryTime >= s.entryTime)
+      .sort((a, b) => a.entryTime! - b.entryTime!)[0];
+    if (match) pairs.push({ shadowNetPnlPct: s.netPnlPct, actualNetPnlPct: match.netPnlPct });
+  }
+  return pairs;
 }
 
 /** SPEC.md section 11.4: how closely the shadow method matches real quotes, for selected mints. */
 export function compareShadowVsActual(pairs: readonly ShadowVsActualPair[]): ShadowVsActualResult {
-  if (pairs.length === 0) return { pairs: 0, meanAbsDiffPct: 0, correlation: 0 };
+  if (pairs.length === 0) return { pairs: 0, meanAbsDiffPct: 0, meanSignedDiffPct: 0, correlation: 0 };
   const diffs = pairs.map((p) => Math.abs(p.shadowNetPnlPct - p.actualNetPnlPct));
   return {
     pairs: pairs.length,
     meanAbsDiffPct: mean(diffs),
+    meanSignedDiffPct: mean(pairs.map((p) => p.shadowNetPnlPct - p.actualNetPnlPct)),
     correlation: pearsonCorrelation(
       pairs.map((p) => p.shadowNetPnlPct),
       pairs.map((p) => p.actualNetPnlPct),
@@ -313,6 +361,8 @@ export function formatReport(input: {
   modeLabel?: string;
   /** Paper only: adds the "as if live" block, and the go-live checklist uses it (section 11.4). */
   asIfLive?: AsIfLiveInput;
+  /** This mode's shadows for the report period, duplicates already excluded (section 11.4 shadow section). */
+  shadows?: readonly ShadowRecord[];
 }): string {
   const totals = computeTotals(input.trades, input.feeLosses ?? []);
   const byReason = breakdownByExitReason(input.trades);
@@ -354,6 +404,7 @@ export function formatReport(input: {
     `Component correlations: buyPressure=${correlations.buyPressure.toFixed(2)}, activity=${correlations.activity.toFixed(2)}, ` +
       `momentum=${correlations.momentum.toFixed(2)}, depth=${correlations.depth.toFixed(2)}, holders=${correlations.holders.toFixed(2)}, freshness=${correlations.freshness.toFixed(2)}`,
   );
+  if (input.shadows) lines.push(...formatShadowSection(input.shadows, input.trades));
   const fmtSkipPct = (v: number | null): string => (v === null ? "n/a" : `${v.toFixed(1)}%`);
   lines.push(
     `Skip reasons: ${skipStats.map((s) => `${s.reason}(n=${s.count}, +15m=${fmtSkipPct(s.median15mPctChange)}, +60m=${fmtSkipPct(s.median60mPctChange)})`).join(", ") || "none"}`,
@@ -362,6 +413,32 @@ export function formatReport(input: {
   lines.push(input.asIfLive ? "Go-live checklist (as if live):" : "Go-live checklist:");
   for (const item of checklist) lines.push(`  [${item.pass ? "PASS" : "FAIL"}] ${item.check} (${item.detail})`);
   return lines.join("\n");
+}
+
+function fmtShadowSide(label: string, t: TotalsResult, noData: number): string {
+  const stats =
+    t.trades === 0
+      ? "none with PnL"
+      : `${t.trades} with PnL, win rate ${(t.winRate * 100).toFixed(1)}%, median ${t.medianNetPnlPct.toFixed(1)}%, mean ${t.meanNetPnlPct.toFixed(1)}%, ` +
+        `p10 ${t.p10NetPnlPct.toFixed(1)}%, median $${t.medianNetPnlUsd.toFixed(2)}, mean $${t.meanNetPnlUsd.toFixed(2)}`;
+  return `  ${label}: ${stats}; no data ${noData}`;
+}
+
+/** Section 11.4: selected vs unselected shadows, and shadow vs actual for selected mints. */
+export function formatShadowSection(shadows: readonly ShadowRecord[], trades: readonly TradeRecord[]): string[] {
+  const c = compareShadowsSelectedVsUnselected(shadows);
+  const vs = compareShadowVsActual(pairShadowsWithTrades(shadows, trades));
+  const pp = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}pp`;
+  return [
+    "Shadows (excluding duplicates):",
+    fmtShadowSide("selected", c.selected, c.noData.selected),
+    fmtShadowSide("unselected", c.unselected, c.noData.unselected),
+    `  still open ${c.stillOpen}; unsellable ${c.unsellable} (excluded); "no data" = closed without PnL (classified before the lifecycle fix, never priced)`,
+    vs.pairs === 0
+      ? "  shadow vs actual (selected mints): no pairs"
+      : `  shadow vs actual (selected mints): ${vs.pairs} pairs, mean |diff| ${vs.meanAbsDiffPct.toFixed(1)}pp, ` +
+        `mean diff (shadow - actual) ${pp(vs.meanSignedDiffPct)}, correlation ${vs.correlation.toFixed(2)}`,
+  ];
 }
 
 /** "3 (daily_loss 1, loss_streak 2, both 0); not recorded 14", from the per-trade tags (section 11.1). */

@@ -167,10 +167,11 @@ describe("live fields on positions, trades, shadows, safety cache; fee losses", 
     };
     const a = store.insert(base);
     const b = store.insert({ ...base, mint: "N", mode: "live" });
-    expect(store.getOpenByMint("M")!.id).toBe(a);
-    expect(store.getOpenByMint("M")!.mode).toBe("paper");
-    expect(store.getOpenByMint("N")!.id).toBe(b);
-    expect(store.getOpenByMint("N")!.mode).toBe("live");
+    expect(store.getForMint("M", "paper")!.id).toBe(a);
+    expect(store.getForMint("M", "paper")!.mode).toBe("paper");
+    expect(store.getForMint("N", "live")!.id).toBe(b);
+    expect(store.getForMint("N", "live")!.mode).toBe("live");
+    expect(store.getForMint("M", "live")).toBeUndefined();
     db.close();
   });
 

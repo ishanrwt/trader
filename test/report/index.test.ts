@@ -131,21 +131,27 @@ describe("scoreComponentCorrelations", () => {
 });
 
 describe("shadow comparisons", () => {
+  const sh = (o: Partial<ShadowRecord>): ShadowRecord => ({ mint: "M", entryTime: 0, outcome: "closed", classification: "unselected", netPnlUsd: null, netPnlPct: null, ...o });
   const shadows: ShadowRecord[] = [
-    { outcome: "selected", netPnlUsd: 10, netPnlPct: 20 },
-    { outcome: "selected", netPnlUsd: -5, netPnlPct: -10 },
-    { outcome: "closed", netPnlUsd: 20, netPnlPct: 40 },
-    { outcome: "closed", netPnlUsd: -2, netPnlPct: -5 },
-    { outcome: "unsellable", netPnlUsd: null, netPnlPct: null },
-    { outcome: "open", netPnlUsd: null, netPnlPct: null },
+    sh({ classification: "selected", netPnlUsd: 10, netPnlPct: 20 }),
+    sh({ classification: "selected", netPnlUsd: -5, netPnlPct: -10 }),
+    sh({ classification: "selected" }), // closed, no PnL: classified before the lifecycle fix ("no data")
+    sh({ netPnlUsd: 20, netPnlPct: 40 }),
+    sh({ netPnlUsd: -2, netPnlPct: -5 }),
+    sh({ classification: "unsellable", netPnlUsd: 3, netPnlPct: 12 }), // priced, but excluded
+    sh({ outcome: "open", classification: "selected" }), // still being priced
+    sh({ outcome: "open" }),
   ];
 
-  it("compares selected vs unselected, excluding unsellable and still-open shadows", () => {
+  it("compares selected vs unselected over closed, priced shadows; counts no-data, still-open and unsellable separately", () => {
     const result = compareShadowsSelectedVsUnselected(shadows);
     expect(result.selected.trades).toBe(2);
     expect(result.selected.totalNetPnlUsd).toBeCloseTo(5, 10);
     expect(result.unselected.trades).toBe(2);
     expect(result.unselected.totalNetPnlUsd).toBeCloseTo(18, 10);
+    expect(result.noData).toEqual({ selected: 1, unselected: 0 });
+    expect(result.stillOpen).toBe(2);
+    expect(result.unsellable).toBe(1);
   });
 
   it("compares shadow vs actual pnl for selected mints (hand-checked: two points give a perfect correlation)", () => {
@@ -155,6 +161,7 @@ describe("shadow comparisons", () => {
     ]);
     expect(result.pairs).toBe(2);
     expect(result.meanAbsDiffPct).toBeCloseTo(1.5, 10); // mean(|20-22|, |-5+4|) = mean(2,1)
+    expect(result.meanSignedDiffPct).toBeCloseTo(-1.5, 10); // mean(20-22, -5+4) = mean(-2,-1): the shadow was pessimistic
     expect(result.correlation).toBeCloseTo(1, 6);
   });
 });

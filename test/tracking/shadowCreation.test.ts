@@ -181,7 +181,8 @@ describe("migration 0007_shadow_one_per_mint", () => {
     ];
     for (const r of rows) insert.run(...r);
 
-    runMigrations(db, MIGRATIONS); // applies 0007
+    fs.copyFileSync(path.join(MIGRATIONS, "0007_shadow_one_per_mint.sql"), path.join(dir, "0007_shadow_one_per_mint.sql"));
+    runMigrations(db, dir); // applies 0007 only, so the assertions below are about 0007 alone
     expect(db.pragma("user_version", { simple: true })).toBe(7);
 
     const after = db.prepare("SELECT id, outcome, duplicate_of FROM shadows ORDER BY id").all() as Array<{ id: number; outcome: string; duplicate_of: number | null }>;
@@ -193,11 +194,12 @@ describe("migration 0007_shadow_one_per_mint", () => {
     expect([outcome(1), outcome(4), outcome(15)]).toEqual(["closed", "closed", "closed"]); // no classification to carry: unchanged
     expect([outcome(2), outcome(3), outcome(8), outcome(13)]).toEqual(["closed", "open", "unsellable", "unsellable"]); // duplicates keep their own data
 
+    runMigrations(db, MIGRATIONS); // then the rest, so the current ShadowsStore can read the table
     const store = new ShadowsStore(db);
     expect(store.listAll().map((s) => s.id)).toEqual([1, 4, 6, 7, 9, 11, 15, 16]);
     expect(store.listOpen().map((s) => s.id)).toEqual([6, 16]); // open duplicate 3 is gone from the poll
     expect(store.countOpen()).toBe(2);
-    expect(store.getOpenByMint("A")).toBeUndefined();
+    expect(store.getForMint("A", "paper")!.id).toBe(1); // never the duplicate
     expect(store.getForMint("E", "paper")!.id).toBe(11);
     expect(store.get(3)!.duplicateOf).toBe(1); // still readable by id
 

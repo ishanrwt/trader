@@ -45,6 +45,7 @@ import {
 } from "./notify/urgent.js";
 import { computeTotals, formatReport, formatWouldBlockCounts, type ReplayableTradeRecord } from "./report/index.js";
 import { replayAsIfLive, type ReplayConfig } from "./report/asIfLive.js";
+import { shadowRecordsFor } from "./report/shadowRecords.js";
 import { checkKillSwitch, perModeKey, realizedNetPnlForDay, unrealizedLossForMode } from "./risk/index.js";
 import { activeHalts, entryBlockerReason, evaluateHalts, readHalts, recordTradeForStreak, wouldBlockTag, type HaltConfig, type HaltEffects } from "./risk/halts.js";
 import { LaneLimiter } from "./limiters/laneLimiter.js";
@@ -74,7 +75,7 @@ import { tradeFromPosition } from "./storage/tradeFromPosition.js";
 import { TradeHistoryStore } from "./storage/tradeHistory.js";
 import { paperEntryFill, paperExitFill, shouldWriteOff } from "./executor/paper.js";
 import { shadowStep, shadowValue } from "./tracking/shadows.js";
-import { createShadowOnReady } from "./tracking/shadowCreation.js";
+import { createShadowOnReady, markShadowSelected, markShadowUnsellable } from "./tracking/shadowCreation.js";
 import { dueOffsetMinutes as skipDueOffset, isSkipTrackResolved } from "./tracking/skipTracking.js";
 import { dueOffsetMinutes as postExitDueOffset, isPostExitTrackResolved } from "./tracking/postExit.js";
 import { formatClockInZone, tradingDayKey } from "./time.js";
@@ -654,8 +655,7 @@ async function main(): Promise<void> {
       },
       markUnsellable: (mint) => {
         pendingStore.removePending(mint);
-        const shadow = shadowsStore.getOpenByMint(mint);
-        if (shadow) shadowsStore.update(shadow.id, { outcome: "unsellable" });
+        markShadowUnsellable(shadowsStore, mint, config.MODE); // section 11.2
       },
       entryBlocked: () => entryBlocked() !== null,
       logger,
@@ -1007,8 +1007,7 @@ async function main(): Promise<void> {
     if (state.history.length > 0) positionsStore.appendHistory(id, state.history[0]!);
     pendingStore.removePending(candidate.mint); // bought (section 4)
 
-    const shadow = shadowsStore.getOpenByMint(candidate.mint);
-    if (shadow) shadowsStore.update(shadow.id, { outcome: "selected" });
+    markShadowSelected(shadowsStore, candidate.mint, config.MODE); // section 11.2: even if the shadow already closed
 
     funnel.entered++;
     funnel.scoreRangeOfEntries = funnel.scoreRangeOfEntries
@@ -1393,6 +1392,7 @@ async function main(): Promise<void> {
         scoreComponents: components,
         proceedsUnknown: t.proceedsUnknown,
         entryTime: t.entryTime,
+        mint: t.mint,
         wouldBlockAtEntry: t.wouldBlockAtEntry,
       };
     });
@@ -1408,6 +1408,7 @@ async function main(): Promise<void> {
       trades: tradeRowsToRecords(mode, opts.from, opts.to),
       ...(mode === "live" ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) } : {}),
       paperTrades: tradeRowsToRecords("paper"),
+      shadows: shadowRecordsFor(shadowsStore.listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       ...(mode === "paper"
         ? { asIfLive: { cfg: asIfLiveCfg(), allPaperTrades: tradeRowsToRecords("paper"), ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) } }
         : {}),

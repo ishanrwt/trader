@@ -124,20 +124,25 @@ function newShadow(overrides: Partial<NewShadowRow> = {}): NewShadowRow {
 }
 
 describe("ShadowsStore", () => {
-  it("inserts, transitions outcome, and lists/counts open shadows", () => {
+  it("classification is independent of lifecycle: a selected shadow stays open (and polled) until it closes", () => {
     const store = new ShadowsStore(openDb(":memory:"));
     const id = store.insert(newShadow());
+    expect(store.get(id)).toMatchObject({ outcome: "open", classification: "unselected" });
+    store.update(id, { classification: "selected" });
     expect(store.countOpen()).toBe(1);
-    store.update(id, { outcome: "selected" });
+    expect(store.listOpen().map((s) => s.id)).toEqual([id]);
+    store.update(id, { outcome: "closed" });
     expect(store.countOpen()).toBe(0);
-    expect(store.get(id)!.outcome).toBe("selected");
+    expect(store.get(id)).toMatchObject({ outcome: "closed", classification: "selected" });
   });
 
-  it("getOpenByMint finds the open shadow for a mint", () => {
+  it("getForMint finds the mint's shadow in any lifecycle state, for that mode only", () => {
     const store = new ShadowsStore(openDb(":memory:"));
-    store.insert(newShadow({ mint: "A" }));
-    expect(store.getOpenByMint("A")?.mint).toBe("A");
-    expect(store.getOpenByMint("B")).toBeUndefined();
+    const id = store.insert(newShadow({ mint: "A" }));
+    store.update(id, { outcome: "closed" });
+    expect(store.getForMint("A", "paper")?.id).toBe(id);
+    expect(store.getForMint("A", "live")).toBeUndefined();
+    expect(store.getForMint("B", "paper")).toBeUndefined();
   });
 });
 

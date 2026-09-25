@@ -6,6 +6,8 @@ import { buildWindowsReport } from "./windows.js";
 import { tradingDayKey } from "../time.js";
 import { openDb } from "../storage/db.js";
 import { TradesStore } from "../storage/trades.js";
+import { ShadowsStore } from "../storage/shadows.js";
+import { shadowRecordsFor } from "./shadowRecords.js";
 import { TradeHistoryStore } from "../storage/tradeHistory.js";
 import { SkipTracksStore } from "../storage/skipTracks.js";
 import { PositionsStore } from "../storage/positions.js";
@@ -116,6 +118,7 @@ function main(): void {
         scoreComponents: t.scoreComponents as ReplayableTradeRecord["scoreComponents"],
         proceedsUnknown: t.proceedsUnknown,
         entryTime: t.entryTime,
+        mint: t.mint,
         wouldBlockAtEntry: t.wouldBlockAtEntry,
       };
     });
@@ -145,6 +148,7 @@ function main(): void {
         ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) }
         : {}),
       ...(opts.mode ? {} : { modeLabel: mode.toUpperCase() }),
+      shadows: shadowRecordsFor(new ShadowsStore(db).listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       // Section 11.4: paper also gets the "as if live" view, and the go-live checklist uses it.
       ...(mode === "paper"
         ? {
