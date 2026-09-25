@@ -1,7 +1,9 @@
 import path from "node:path";
 import { loadEnv } from "../config/loadEnv.js";
 import { loadReportConfig, ReportConfigError } from "../config/reportConfig.js";
-import { formatReport, formatTradeDetail, tradeRowToDetailRecord, type ReplayableTradeRecord } from "./index.js";
+import { formatReport, formatTradeDetail, tradeRowToDetailRecord, tradeRowToRecord, type ReplayableTradeRecord } from "./index.js";
+import { postExitRecordsFor } from "./postExitRecords.js";
+import { PostExitTracksStore } from "../storage/postExitTracks.js";
 import { buildWindowsReport } from "./windows.js";
 import { tradingDayKey } from "../time.js";
 import { openDb } from "../storage/db.js";
@@ -99,29 +101,7 @@ function main(): void {
   }
 
   function toRecords(mode?: "paper" | "live", from?: string, to?: string): ReplayableTradeRecord[] {
-    return tradesStore.listAll({ ...(mode ? { mode } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}) }).map((t) => {
-      const snapshot = t.entryPairSnapshot as DexPair | null;
-      return {
-        mode: t.mode as "paper" | "live",
-        exitTime: t.exitTime,
-        tradingDay: t.tradingDay,
-        exitReason: t.exitReason,
-        netPnlUsd: t.netPnlUsd,
-        netPnlPct: t.netPnlPct,
-        m5ChangePct: snapshot?.priceChange?.m5 ?? null,
-        h1ChangePct: snapshot?.priceChange?.h1 ?? null,
-        buyPressurePct: null,
-        liquidityUsd: snapshot?.liquidity?.usd ?? null,
-        pairAgeMs: snapshot?.pairCreatedAt ? t.entryTime - snapshot.pairCreatedAt : null,
-        top10Pct: t.top10Pct,
-        score: t.score,
-        scoreComponents: t.scoreComponents as ReplayableTradeRecord["scoreComponents"],
-        proceedsUnknown: t.proceedsUnknown,
-        entryTime: t.entryTime,
-        mint: t.mint,
-        wouldBlockAtEntry: t.wouldBlockAtEntry,
-      };
-    });
+    return tradesStore.listAll({ ...(mode ? { mode } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}) }).map(tradeRowToRecord);
   }
   const feeLossesStore = new FeeLossesStore(db);
 
@@ -148,6 +128,7 @@ function main(): void {
         ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) }
         : {}),
       ...(opts.mode ? {} : { modeLabel: mode.toUpperCase() }),
+      postExit: postExitRecordsFor(new PostExitTracksStore(db).listAll(), tradesStore.listAll(), { mode, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       shadows: shadowRecordsFor(new ShadowsStore(db).listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       // Section 11.4: paper also gets the "as if live" view, and the go-live checklist uses it.
       ...(mode === "paper"

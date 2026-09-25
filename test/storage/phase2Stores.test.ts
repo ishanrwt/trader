@@ -172,7 +172,8 @@ describe("PostExitTracksStore", () => {
     const db = openDb(":memory:");
     const tradeId = new TradesStore(db).insert(newTrade());
     const store = new PostExitTracksStore(db);
-    const id = store.insert({ tradeId, mint: "A", exitTime: 0, exitPriceUsd: 1 });
+    const id = store.insert({ tradeId, mint: "A", exitTime: 0, exitPriceUsd: 1, exitPriceSource: "dexscreener_at_exit" });
+    expect(store.listAll()[0]!.exitPriceSource).toBe("dexscreener_at_exit");
     store.setPrice15m(id, 1.1);
     store.setPrice30m(id, 1.2);
     expect(store.listUnresolved().length).toBe(1);

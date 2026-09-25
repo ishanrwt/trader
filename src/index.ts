@@ -43,7 +43,8 @@ import {
   buildStartupMessage,
   buildStuckSellMessage,
 } from "./notify/urgent.js";
-import { computeTotals, formatReport, formatWouldBlockCounts, type ReplayableTradeRecord } from "./report/index.js";
+import { computeTotals, formatReport, formatWouldBlockCounts, tradeRowToRecord, type ReplayableTradeRecord } from "./report/index.js";
+import { postExitRecordsFor } from "./report/postExitRecords.js";
 import { replayAsIfLive, type ReplayConfig } from "./report/asIfLive.js";
 import { shadowRecordsFor } from "./report/shadowRecords.js";
 import { checkKillSwitch, perModeKey, realizedNetPnlForDay, unrealizedLossForMode } from "./risk/index.js";
@@ -76,6 +77,7 @@ import { TradeHistoryStore } from "./storage/tradeHistory.js";
 import { paperEntryFill, paperExitFill, shouldWriteOff } from "./executor/paper.js";
 import { shadowStep, shadowValue } from "./tracking/shadows.js";
 import { createShadowOnReady, markShadowSelected, markShadowUnsellable } from "./tracking/shadowCreation.js";
+import { dexPriceAtExit } from "./tracking/exitPrice.js";
 import { dueOffsetMinutes as skipDueOffset, isSkipTrackResolved } from "./tracking/skipTracking.js";
 import { dueOffsetMinutes as postExitDueOffset, isPostExitTrackResolved } from "./tracking/postExit.js";
 import { formatClockInZone, tradingDayKey } from "./time.js";
@@ -578,7 +580,8 @@ async function main(): Promise<void> {
     if (config.SKIP_TRACK_MAX_PER_HOUR > 0) {
       for (const removed of result.removedNeverReady) {
         if (skipTracksStore.countInWindow(now - 3_600_000) >= config.SKIP_TRACK_MAX_PER_HOUR) break;
-        skipTracksStore.insert({ mint: removed.mint, skipReason: removed.reason, discoveredAt: now, skippedAt: now, priceAtSkipUsd: null });
+        // Section 11.3: the baseline is the DexScreener price from the recheck that dropped the mint (null for a `pair` skip).
+        skipTracksStore.insert({ mint: removed.mint, skipReason: removed.reason, discoveredAt: removed.discoveredAt, skippedAt: now, priceAtSkipUsd: removed.priceUsd });
       }
     }
 
@@ -1181,7 +1184,6 @@ async function main(): Promise<void> {
     const netPnlPct = (netPnlUsd / row.costBasis) * 100;
     const tradingDay = tradingDayKey(now, config.TRADING_DAY_TZ);
 
-    const entrySnapshot = row.entryPairSnapshot as DexPair | null;
     const tradeId = tradesStore.insert(
       tradeFromPosition({ row, proceeds, exitReason, exitTime: now, tradingDay, exitQuote, defaultFeesUsd: config.PAPER_FEE_USD_PER_TX * 2, extras }),
     );
@@ -1198,7 +1200,9 @@ async function main(): Promise<void> {
     evaluateHaltsNow(); // section 9.1/10: a new halt or pause alerts now, not at the next entry check
 
     if (config.POST_EXIT_TRACK) {
-      postExitTracksStore.insert({ tradeId, mint: row.mint, exitTime: now, exitPriceUsd: entrySnapshot ? Number(entrySnapshot.priceUsd ?? "0") : null });
+      // Section 11.3: the baseline is the DexScreener price at exit (was wrongly the entry snapshot's price).
+      const exitPriceUsd = await dexPriceAtExit((mints) => dexClient.getPairs(SOLANA_CHAIN_ID, mints), row.mint, config.ALLOWED_QUOTE_MINTS, logger);
+      postExitTracksStore.insert({ tradeId, mint: row.mint, exitTime: now, exitPriceUsd, exitPriceSource: "dexscreener_at_exit" });
     }
 
     logEvent(db, now, "exit", `Closed ${row.mint} (${exitReason})`, { mint: row.mint, exitReason, netPnlUsd });
@@ -1372,30 +1376,7 @@ async function main(): Promise<void> {
   }
 
   function tradeRowsToRecords(mode?: "paper" | "live", from?: string, to?: string): ReplayableTradeRecord[] {
-    return tradesStore.listAll({ ...(mode ? { mode } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}) }).map((t) => {
-      const snapshot = t.entryPairSnapshot as DexPair | null;
-      const components = t.scoreComponents as ReplayableTradeRecord["scoreComponents"];
-      return {
-        mode: t.mode as "paper" | "live",
-        exitTime: t.exitTime,
-        tradingDay: t.tradingDay,
-        exitReason: t.exitReason,
-        netPnlUsd: t.netPnlUsd,
-        netPnlPct: t.netPnlPct,
-        m5ChangePct: snapshot?.priceChange?.m5 ?? null,
-        h1ChangePct: snapshot?.priceChange?.h1 ?? null,
-        buyPressurePct: null,
-        liquidityUsd: snapshot?.liquidity?.usd ?? null,
-        pairAgeMs: snapshot?.pairCreatedAt ? t.entryTime - snapshot.pairCreatedAt : null,
-        top10Pct: t.top10Pct,
-        score: t.score,
-        scoreComponents: components,
-        proceedsUnknown: t.proceedsUnknown,
-        entryTime: t.entryTime,
-        mint: t.mint,
-        wouldBlockAtEntry: t.wouldBlockAtEntry,
-      };
-    });
+    return tradesStore.listAll({ ...(mode ? { mode } : {}), ...(from ? { from } : {}), ...(to ? { to } : {}) }).map(tradeRowToRecord);
   }
 
   /** /report: the current mode only (section 11.4: paper and live are never mixed). */
@@ -1408,6 +1389,7 @@ async function main(): Promise<void> {
       trades: tradeRowsToRecords(mode, opts.from, opts.to),
       ...(mode === "live" ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) } : {}),
       paperTrades: tradeRowsToRecords("paper"),
+      postExit: postExitRecordsFor(postExitTracksStore.listAll(), tradesStore.listAll(), { mode, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       shadows: shadowRecordsFor(shadowsStore.listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       ...(mode === "paper"
         ? { asIfLive: { cfg: asIfLiveCfg(), allPaperTrades: tradeRowsToRecords("paper"), ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) } }

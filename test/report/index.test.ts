@@ -166,15 +166,28 @@ describe("shadow comparisons", () => {
   });
 });
 
-describe("exitedTooEarly", () => {
-  it("hand-checked: one of two priced rows shows upside after the exit", () => {
+describe("exitedTooEarly (per horizon, valid exit prices only)", () => {
+  const ok = "dexscreener_at_exit";
+  it("hand-checked: +15m and +60m are reported separately", () => {
     const result = exitedTooEarly([
-      { exitPriceUsd: 1, price15mUsd: 1.2, price60mUsd: null }, // +20%
-      { exitPriceUsd: 1, price15mUsd: 0.9, price60mUsd: 0.8 }, // best 0.9 -> -10%, not "too early"
-      { exitPriceUsd: 2, price15mUsd: null, price60mUsd: null }, // no data, excluded
+      { exitPriceUsd: 1, exitPriceSource: ok, price15mUsd: 1.2, price60mUsd: null }, // +15m +20%
+      { exitPriceUsd: 1, exitPriceSource: ok, price15mUsd: 0.9, price60mUsd: 1.5 }, // +15m -10%, +60m +50%
+      { exitPriceUsd: 2, exitPriceSource: ok, price15mUsd: 2.2, price60mUsd: 1.8 }, // +15m +10%, +60m -10%
+      { exitPriceUsd: 2, exitPriceSource: ok, price15mUsd: null, price60mUsd: null }, // no readings: in neither horizon
     ]);
-    expect(result.shareTooEarly).toBeCloseTo(0.5, 10);
-    expect(result.medianUpsidePctMissed).toBeCloseTo(20, 10);
+    expect(result.at15m).toEqual({ withData: 3, shareAbove: 2 / 3, medianUpsidePct: expect.closeTo(15, 10) }); // median(20, 10)
+    expect(result.at60m).toEqual({ withData: 2, shareAbove: 0.5, medianUpsidePct: expect.closeTo(50, 10) });
+    expect(result.excludedNoValidExitPrice).toBe(0);
+  });
+
+  it("leaves out rows whose exit price is the old entry-snapshot price, or missing, and counts them", () => {
+    const result = exitedTooEarly([
+      { exitPriceUsd: 1, exitPriceSource: "entry_snapshot", price15mUsd: 5, price60mUsd: 5 },
+      { exitPriceUsd: null, exitPriceSource: ok, price15mUsd: 5, price60mUsd: 5 },
+      { exitPriceUsd: 1, exitPriceSource: ok, price15mUsd: 0.5, price60mUsd: null },
+    ]);
+    expect(result.excludedNoValidExitPrice).toBe(2);
+    expect(result.at15m).toEqual({ withData: 1, shareAbove: 0, medianUpsidePct: 0 });
   });
 });
 
@@ -256,7 +269,7 @@ describe("formatReport", () => {
       hasStuckPositions: false,
       goLiveConfig: { minTrades: 4, minDays: 0, minMedianPnlPct: 0, minTotalPnlUsd: -1, minP10PnlPct: -50 },
     });
-    expect(text).toContain("pair(n=1, +15m=n/a, +60m=n/a)");
+    expect(text).toContain("pair(n=1, with baseline 1, +15m=n/a, +60m=n/a)");
     expect(text).not.toContain("+15m=0.0%");
   });
 });

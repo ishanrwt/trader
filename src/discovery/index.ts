@@ -76,7 +76,12 @@ export interface RecheckPendingResult {
   /** Number of pair-fetch batches that failed (for outage/health tracking). */
   failedBatches: number;
   /** Mints removed this call that never reached READY (section 11.3: skip tracking). */
-  removedNeverReady: Array<{ mint: string; reason: string }>;
+  /**
+   * Mints dropped without ever becoming READY (section 11.3 skip tracking), with the
+   * DexScreener priceUsd from this recheck's batch as the baseline (null when the mint
+   * has no valid pair, e.g. a `pair` skip) and when the mint was first discovered.
+   */
+  removedNeverReady: Array<{ mint: string; reason: string; priceUsd: number | null; discoveredAt: number }>;
 }
 
 export interface Phase2GateDeps {
@@ -144,11 +149,15 @@ export async function recheckPending(opts: {
 
     for (const row of batch) {
       result.checked++;
+      const skipped = (reason: string) => {
+        const price = Number(selectPair(pairs, row.mint, opts.allowedQuoteMints)?.priceUsd ?? NaN);
+        return { mint: row.mint, reason, priceUsd: Number.isFinite(price) && price > 0 ? price : null, discoveredAt: row.discoveredAt };
+      };
 
       if (opts.now - row.discoveredAt > opts.maxPendingAgeMin * 60_000) {
         opts.store.removePending(row.mint);
         result.removedAged++;
-        if (row.status !== "READY") result.removedNeverReady.push({ mint: row.mint, reason: "aged_out" });
+        if (row.status !== "READY") result.removedNeverReady.push(skipped("aged_out"));
         continue;
       }
 
@@ -198,7 +207,7 @@ export async function recheckPending(opts: {
           (result.skippedMints.mintSafety ??= []).push(row.mint);
           opts.store.removePending(row.mint);
           result.removedPermanent++;
-          result.removedNeverReady.push({ mint: row.mint, reason: "mintSafety" });
+          result.removedNeverReady.push(skipped("mintSafety"));
           continue;
         }
 
@@ -240,7 +249,7 @@ export async function recheckPending(opts: {
         if (noPairChecks >= opts.maxNoPairChecks) {
           opts.store.removePending(row.mint);
           result.removedPermanent++;
-          if (row.status !== "READY") result.removedNeverReady.push({ mint: row.mint, reason: "pair" });
+          if (row.status !== "READY") result.removedNeverReady.push(skipped("pair"));
         } else {
           opts.store.updatePending(row.mint, {
             noPairChecks,
@@ -254,7 +263,7 @@ export async function recheckPending(opts: {
       if (gateResult.outcome === "permanent_fail") {
         opts.store.removePending(row.mint);
         result.removedPermanent++;
-        if (row.status !== "READY") result.removedNeverReady.push({ mint: row.mint, reason: gateResult.check });
+        if (row.status !== "READY") result.removedNeverReady.push(skipped(gateResult.check));
         continue;
       }
 

@@ -129,12 +129,21 @@ export interface QuantileBucketResult {
   bucket: number;
   count: number;
   totals: TotalsResult;
+  /** Lowest and highest feature value in the bucket. */
+  min: number;
+  max: number;
 }
 
 /** SPEC.md section 11.4: results by entry-feature (or score) quantile buckets, earliest/lowest bucket first. */
 export function quantileBuckets(trades: readonly TradeRecord[], keyFn: (t: TradeRecord) => number | null, buckets: number): QuantileBucketResult[] {
   const withKey = trades.filter((t) => keyFn(t) !== null).sort((a, b) => keyFn(a)! - keyFn(b)!);
-  return equalSizeBuckets(withKey, buckets).map((group, i) => ({ bucket: i + 1, count: group.length, totals: computeTotals(group) }));
+  return equalSizeBuckets(withKey, buckets).map((group, i) => ({
+    bucket: i + 1,
+    count: group.length,
+    totals: computeTotals(group),
+    min: keyFn(group[0]!)!,
+    max: keyFn(group[group.length - 1]!)!,
+  }));
 }
 
 export interface ScoreComponentCorrelations {
@@ -269,30 +278,44 @@ export function compareShadowVsActual(pairs: readonly ShadowVsActualPair[]): Sha
   };
 }
 
-export interface ExitedTooEarlyInput {
-  exitPriceUsd: number;
+/** A post-exit track as the report sees it (section 11.3). */
+export interface PostExitRecord {
+  exitPriceUsd: number | null;
+  /** 'dexscreener_at_exit' is the only valid baseline; 'entry_snapshot' rows predate the fix. */
+  exitPriceSource: string | null;
   price15mUsd: number | null;
   price60mUsd: number | null;
 }
 
-export interface ExitedTooEarlyResult {
-  shareTooEarly: number;
-  medianUpsidePctMissed: number;
+export interface HorizonResult {
+  /** Trades with a valid exit price and a reading at this horizon. */
+  withData: number;
+  /** Share of those whose price at the horizon exceeded the exit price. */
+  shareAbove: number;
+  /** Median % above the exit price, among those that were above (0 if none). */
+  medianUpsidePct: number;
 }
 
-/** SPEC.md section 11.4: share of trades whose post-exit price at +15/+60 exceeded the exit price, and by how much. */
-export function exitedTooEarly(rows: readonly ExitedTooEarlyInput[]): ExitedTooEarlyResult {
-  const withData = rows.filter((r) => r.price15mUsd !== null || r.price60mUsd !== null);
-  if (withData.length === 0) return { shareTooEarly: 0, medianUpsidePctMissed: 0 };
-  const upsides = withData.map((r) => {
-    const best = Math.max(r.price15mUsd ?? -Infinity, r.price60mUsd ?? -Infinity);
-    return ((best - r.exitPriceUsd) / r.exitPriceUsd) * 100;
-  });
-  const tooEarly = upsides.filter((u) => u > 0);
-  return {
-    shareTooEarly: tooEarly.length / withData.length,
-    medianUpsidePctMissed: median(tooEarly.length > 0 ? tooEarly : [0]),
+export interface ExitedTooEarlyResult {
+  at15m: HorizonResult;
+  at60m: HorizonResult;
+  /** Rows left out: no DexScreener price at exit (recorded before the fix, or the fetch failed). */
+  excludedNoValidExitPrice: number;
+}
+
+/** SPEC.md section 11.4: share of trades whose post-exit price at +15 and at +60 min exceeded the exit price, and by how much. */
+export function exitedTooEarly(rows: readonly PostExitRecord[]): ExitedTooEarlyResult {
+  const valid = rows.filter((r) => r.exitPriceSource === "dexscreener_at_exit" && r.exitPriceUsd !== null && r.exitPriceUsd > 0);
+  const horizon = (priceAt: (r: PostExitRecord) => number | null): HorizonResult => {
+    const withData = valid.filter((r) => priceAt(r) !== null);
+    const upsides = withData.map((r) => ((priceAt(r)! - r.exitPriceUsd!) / r.exitPriceUsd!) * 100).filter((u) => u > 0);
+    return {
+      withData: withData.length,
+      shareAbove: withData.length > 0 ? upsides.length / withData.length : 0,
+      medianUpsidePct: upsides.length > 0 ? median(upsides) : 0,
+    };
   };
+  return { at15m: horizon((r) => r.price15mUsd), at60m: horizon((r) => r.price60mUsd), excludedNoValidExitPrice: rows.length - valid.length };
 }
 
 export interface SkipTrackRecord {
@@ -305,6 +328,8 @@ export interface SkipTrackRecord {
 export interface SkipReasonStat {
   reason: string;
   count: number;
+  /** Rows with a price at skip (the baseline); rows recorded before the section 11.3 fix, and `pair` skips, have none. */
+  withBaseline: number;
   /** null when no mint in this group has a priced +15m reading (e.g. it never had a valid pair) — distinct from a genuine 0% change. */
   median15mPctChange: number | null;
   /** null when no mint in this group has a priced +60m reading. */
@@ -329,6 +354,7 @@ export function skipReasonStats(rows: readonly SkipTrackRecord[]): SkipReasonSta
   return [...byReason.entries()].map(([reason, rs]) => ({
     reason,
     count: rs.length,
+    withBaseline: rs.filter((r) => r.priceAtSkipUsd !== null && r.priceAtSkipUsd > 0).length,
     median15mPctChange: medianOrMissing(rs.map((r) => pctChange(r.priceAtSkipUsd, r.price15mUsd))),
     median60mPctChange: medianOrMissing(rs.map((r) => pctChange(r.priceAtSkipUsd, r.price60mUsd))),
   }));
@@ -363,6 +389,8 @@ export function formatReport(input: {
   asIfLive?: AsIfLiveInput;
   /** This mode's shadows for the report period, duplicates already excluded (section 11.4 shadow section). */
   shadows?: readonly ShadowRecord[];
+  /** This mode's post-exit tracks for the report period (section 11.4 exited too early). */
+  postExit?: readonly PostExitRecord[];
 }): string {
   const totals = computeTotals(input.trades, input.feeLosses ?? []);
   const byReason = breakdownByExitReason(input.trades);
@@ -384,6 +412,10 @@ export function formatReport(input: {
   lines.push(
     `Win rate ${(totals.winRate * 100).toFixed(1)}%, median ${totals.medianNetPnlPct.toFixed(1)}%, total $${totals.totalNetPnlUsd.toFixed(2)}, max drawdown $${totals.maxDrawdownUsd.toFixed(2)}`,
   );
+  lines.push(
+    `Mean ${totals.meanNetPnlPct.toFixed(1)}%, median $${totals.medianNetPnlUsd.toFixed(2)}, mean $${totals.meanNetPnlUsd.toFixed(2)}, ` +
+      `p10 ${totals.p10NetPnlPct.toFixed(1)}%, p90 ${totals.p90NetPnlPct.toFixed(1)}%, avg win $${totals.avgWinUsd.toFixed(2)} vs avg loss $${totals.avgLossUsd.toFixed(2)}`,
+  );
   if (totals.proceedsUnknownCount > 0) {
     lines.push(
       `Proceeds unknown (reconciled, shown separately; excluded from win rate/median/mean/percentiles, included in total): ${totals.proceedsUnknownCount} trades, $${totals.proceedsUnknownUsd.toFixed(2)}`,
@@ -398,21 +430,103 @@ export function formatReport(input: {
     );
   }
   lines.push(`By exit reason: ${Object.entries(byReason).map(([r, t]) => `${r}=${t.trades}`).join(", ") || "none"}`);
+  for (const [reason, t] of Object.entries(byReason)) lines.push(`  ${reason}: ${fmtGroup(t)}`);
   lines.push(`Trading days: ${Object.keys(byDay).length}`);
+  for (const day of Object.keys(byDay).sort()) lines.push(`  ${day}: ${fmtGroup(byDay[day]!)}`);
+  lines.push(...formatFeatureQuartiles(input.trades));
   lines.push(`Score quintiles (trades/win rate): ${scoreQuintiles.map((b) => `${b.count}/${(b.totals.winRate * 100).toFixed(0)}%`).join(", ") || "none"}`);
   lines.push(
     `Component correlations: buyPressure=${correlations.buyPressure.toFixed(2)}, activity=${correlations.activity.toFixed(2)}, ` +
       `momentum=${correlations.momentum.toFixed(2)}, depth=${correlations.depth.toFixed(2)}, holders=${correlations.holders.toFixed(2)}, freshness=${correlations.freshness.toFixed(2)}`,
   );
   if (input.shadows) lines.push(...formatShadowSection(input.shadows, input.trades));
+  if (input.postExit) lines.push(...formatExitedTooEarly(exitedTooEarly(input.postExit)));
   const fmtSkipPct = (v: number | null): string => (v === null ? "n/a" : `${v.toFixed(1)}%`);
   lines.push(
-    `Skip reasons: ${skipStats.map((s) => `${s.reason}(n=${s.count}, +15m=${fmtSkipPct(s.median15mPctChange)}, +60m=${fmtSkipPct(s.median60mPctChange)})`).join(", ") || "none"}`,
+    `Skip reasons (median change from the price at skip; only rows with that baseline): ${
+      skipStats.map((s) => `${s.reason}(n=${s.count}, with baseline ${s.withBaseline}, +15m=${fmtSkipPct(s.median15mPctChange)}, +60m=${fmtSkipPct(s.median60mPctChange)})`).join(", ") || "none"
+    }`,
   );
   if (input.asIfLive && replay) lines.push(...formatAsIfLive(input.asIfLive, replay));
   lines.push(input.asIfLive ? "Go-live checklist (as if live):" : "Go-live checklist:");
   for (const item of checklist) lines.push(`  [${item.pass ? "PASS" : "FAIL"}] ${item.check} (${item.detail})`);
   return lines.join("\n");
+}
+
+function fmtGroup(t: TotalsResult): string {
+  return `${t.trades} trades, win rate ${(t.winRate * 100).toFixed(1)}%, median ${t.medianNetPnlPct.toFixed(1)}%, total $${t.totalNetPnlUsd.toFixed(2)}`;
+}
+
+/** Section 11.4 entry features, in order; pair age is shown in minutes. */
+const ENTRY_FEATURES: ReadonlyArray<{ label: string; key: (t: TradeRecord) => number | null; fmt: (v: number) => string }> = [
+  { label: "m5 change %", key: (t) => t.m5ChangePct, fmt: (v) => v.toFixed(1) },
+  { label: "h1 change %", key: (t) => t.h1ChangePct, fmt: (v) => v.toFixed(1) },
+  { label: "buy pressure %", key: (t) => t.buyPressurePct, fmt: (v) => v.toFixed(1) },
+  { label: "liquidity $", key: (t) => t.liquidityUsd, fmt: (v) => v.toFixed(0) },
+  { label: "pair age min", key: (t) => (t.pairAgeMs === null ? null : t.pairAgeMs / 60_000), fmt: (v) => v.toFixed(1) },
+  { label: "top-10 share %", key: (t) => t.top10Pct, fmt: (v) => v.toFixed(1) },
+];
+
+/** Section 11.4: results by entry-feature quartile (Q1 = lowest values); trades missing a feature are counted, not bucketed. */
+export function formatFeatureQuartiles(trades: readonly TradeRecord[]): string[] {
+  const lines = ["Entry-feature quartiles (Q1 lowest; [range] trades, win rate, median net PnL %):"];
+  for (const f of ENTRY_FEATURES) {
+    const buckets = quantileBuckets(trades, f.key, 4);
+    const missing = trades.filter((t) => f.key(t) === null).length;
+    const parts = buckets.map(
+      (b) => `Q${b.bucket} [${f.fmt(b.min)}..${f.fmt(b.max)}] ${b.count}, ${(b.totals.winRate * 100).toFixed(0)}%, ${b.totals.medianNetPnlPct.toFixed(1)}%`,
+    );
+    lines.push(`  ${f.label}: ${parts.join(" | ") || "no data"}${missing > 0 ? `; missing ${missing}` : ""}`);
+  }
+  return lines;
+}
+
+/** Section 11.4: exited too early, per horizon, from valid DexScreener exit prices only. */
+export function formatExitedTooEarly(r: ExitedTooEarlyResult): string[] {
+  const h = (label: string, x: HorizonResult) =>
+    x.withData === 0
+      ? `  ${label}: no data`
+      : `  ${label}: ${x.withData} with data, ${(x.shareAbove * 100).toFixed(1)}% above the exit price, median upside ${x.medianUpsidePct.toFixed(1)}% among those`;
+  return [
+    "Exited too early (DexScreener price after exit vs at exit):",
+    h("+15m", r.at15m),
+    h("+60m", r.at60m),
+    `  excluded ${r.excludedNoValidExitPrice} with no valid exit price (recorded before the section 11.3 fix, or the fetch at exit failed)`,
+  ];
+}
+
+/** Buy pressure at entry (section 11.4): m5 buys / (buys + sells) x 100 from the stored pair snapshot; null without txns. */
+export function buyPressurePct(snapshot: unknown): number | null {
+  const m5 = (snapshot as { txns?: { m5?: { buys?: unknown; sells?: unknown } } } | null)?.txns?.m5;
+  const buys = finiteOrNull(m5?.buys);
+  const sells = finiteOrNull(m5?.sells);
+  if (buys === null || sells === null || buys + sells <= 0) return null;
+  return (buys / (buys + sells)) * 100;
+}
+
+/** A stored trade as the aggregate report takes it; shared by `npm run report` and `/report`. */
+export function tradeRowToRecord(t: TradeRow): ReplayableTradeRecord {
+  const p = entryPairFields(t.entryPairSnapshot, t.entryTime);
+  return {
+    mode: t.mode as "paper" | "live",
+    exitTime: t.exitTime,
+    tradingDay: t.tradingDay,
+    exitReason: t.exitReason,
+    netPnlUsd: t.netPnlUsd,
+    netPnlPct: t.netPnlPct,
+    m5ChangePct: p?.priceChangeM5 ?? null,
+    h1ChangePct: p?.priceChangeH1 ?? null,
+    buyPressurePct: buyPressurePct(t.entryPairSnapshot),
+    liquidityUsd: p?.liquidityUsd ?? null,
+    pairAgeMs: p?.pairAgeMin === null || p?.pairAgeMin === undefined ? null : p.pairAgeMin * 60_000,
+    top10Pct: t.top10Pct,
+    score: t.score,
+    scoreComponents: t.scoreComponents as TradeRecord["scoreComponents"],
+    proceedsUnknown: t.proceedsUnknown,
+    entryTime: t.entryTime,
+    mint: t.mint,
+    wouldBlockAtEntry: t.wouldBlockAtEntry,
+  };
 }
 
 function fmtShadowSide(label: string, t: TotalsResult, noData: number): string {
