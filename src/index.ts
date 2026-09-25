@@ -64,6 +64,7 @@ import type { PositionRow } from "./storage/positions.js";
 import type { TradeLiveFields } from "./storage/trades.js";
 import { ShutdownCoordinator } from "./shutdown.js";
 import { goLiveChecklist } from "./report/index.js";
+import { buildWindowsReport } from "./report/windows.js";
 import { computePositionSizeUsd, pickNextCandidate, runSlotFilling, type EntryExecution, type ReadyCandidate, type SellabilityMeasurement } from "./selection/index.js";
 import { computeScore } from "./selection/score.js";
 import { SolPriceTracker } from "./solPrice/index.js";
@@ -1430,6 +1431,11 @@ async function main(): Promise<void> {
       timeoutSec: 20,
       buildDigest: () => renderDigest(),
       buildReport: () => buildReport(),
+      buildWindows: () => {
+        const now = Date.now();
+        const day = tradingDayKey(now, config.TRADING_DAY_TZ);
+        return buildWindowsReport(db, { mode: config.MODE, day, timeZone: config.TRADING_DAY_TZ, intervalMin: config.DIGEST_INTERVAL_MINUTES, now });
+      },
       ...(live ? { sellRetry: (prefix: string) => live.executor.sellRetry(prefix) } : {}),
       logger,
       recordEvent: (type, message) => logEvent(db, Date.now(), type, message),

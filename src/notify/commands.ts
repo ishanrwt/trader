@@ -14,7 +14,7 @@ export const KILLED_VIA_COMMAND_KEY = "killedViaCommand";
 export const CONSECUTIVE_ERRORS_KEY = "consecutiveErrors";
 
 /**
- * SPEC.md section 10: /status, /report, /pause, /resume, /killswitch,
+ * SPEC.md section 10: /status, /report, /windows, /pause, /resume, /killswitch,
  * restricted to the configured chat. Unknown commands and messages from
  * other chats are ignored silently.
  */
@@ -25,6 +25,8 @@ export async function pollAndHandleCommands(ctx: {
   timeoutSec: number;
   buildDigest: () => string;
   buildReport: () => string;
+  /** /windows: today's per-window stats for the current mode (section 11.4). Optional so older callers/tests can omit it. */
+  buildWindows?: () => string;
   logger: Logger;
   /** Audit trail (storage/events.ts) — optional so tests that don't care about it can omit it. */
   recordEvent?: (type: string, message: string) => void;
@@ -54,6 +56,7 @@ async function handleCommand(
     stateStore: StateStore;
     buildDigest: () => string;
     buildReport: () => string;
+    buildWindows?: () => string;
     logger: Logger;
     recordEvent?: (type: string, message: string) => void;
     sellRetry?: (prefix: string) => string;
@@ -77,6 +80,9 @@ async function handleCommand(
       break;
     case "/report":
       await ctx.telegram.sendMessage(ctx.buildReport());
+      break;
+    case "/windows":
+      if (ctx.buildWindows) await ctx.telegram.sendMessage(ctx.buildWindows());
       break;
     case "/pause":
       ctx.stateStore.set(PAUSED_KEY, true);

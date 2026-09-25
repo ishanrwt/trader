@@ -2,6 +2,8 @@ import path from "node:path";
 import { loadEnv } from "../config/loadEnv.js";
 import { loadReportConfig, ReportConfigError } from "../config/reportConfig.js";
 import { formatReport, formatTradeDetail, tradeRowToDetailRecord, type TradeRecord } from "./index.js";
+import { buildWindowsReport } from "./windows.js";
+import { tradingDayKey } from "../time.js";
 import { openDb } from "../storage/db.js";
 import { TradesStore } from "../storage/trades.js";
 import { TradeHistoryStore } from "../storage/tradeHistory.js";
@@ -11,8 +13,18 @@ import { FeeLossesStore } from "../storage/feeLosses.js";
 import { shouldWriteOff } from "../executor/paper.js";
 import type { DexPair } from "../types.js";
 
-function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to?: string; db?: string; trades?: boolean } {
-  const out: { mode?: "paper" | "live"; from?: string; to?: string; db?: string; trades?: boolean } = {};
+export interface ReportArgs {
+  mode?: "paper" | "live";
+  from?: string;
+  to?: string;
+  db?: string;
+  trades?: boolean;
+  windows?: boolean;
+  day?: string;
+}
+
+export function parseArgs(argv: string[]): ReportArgs {
+  const out: ReportArgs = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--mode") {
@@ -29,6 +41,11 @@ function parseArgs(argv: string[]): { mode?: "paper" | "live"; from?: string; to
       if (value) out.db = value;
     } else if (arg === "--trades") {
       out.trades = true;
+    } else if (arg === "--windows") {
+      out.windows = true;
+    } else if (arg === "--day") {
+      const value = argv[++i];
+      if (value) out.day = value;
     }
   }
   return out;
@@ -59,6 +76,17 @@ function main(): void {
   const tradeHistoryStore = new TradeHistoryStore(db);
   const skipTracksStore = new SkipTracksStore(db);
   const positionsStore = new PositionsStore(db);
+
+  if (opts.windows) {
+    // Section 11.4: per-window stats for one trading day (default today), each mode separately.
+    const now = Date.now();
+    const day = opts.day ?? tradingDayKey(now, config.TRADING_DAY_TZ);
+    const modes: Array<"paper" | "live"> = opts.mode ? [opts.mode] : ["paper", "live"];
+    const windowOpts = { day, timeZone: config.TRADING_DAY_TZ, intervalMin: config.DIGEST_INTERVAL_MINUTES, now };
+    console.log(modes.map((mode) => buildWindowsReport(db, { mode, ...windowOpts })).join("\n\n"));
+    db.close();
+    return;
+  }
 
   if (opts.trades) {
     const rows = tradesStore.listAll({ ...(opts.mode ? { mode: opts.mode } : {}), ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) });

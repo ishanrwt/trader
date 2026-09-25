@@ -3,7 +3,8 @@ import { envSchema } from "./schema.js";
 /**
  * Only the settings the report (npm run report / /report) actually reads:
  * the go-live checklist thresholds (SPEC.md section 11.4) and
- * STUCK_WRITE_OFF_MIN (to decide if a closing position counts as "stuck").
+ * STUCK_WRITE_OFF_MIN (to decide if a closing position counts as "stuck"),
+ * and DIGEST_INTERVAL_MINUTES (the window size for --windows / /windows).
  * Picked from the same envSchema used by the full bot config (src/config/
  * schema.ts) so the field types/defaults can never drift out of sync with
  * it — but picking excludes every required secret field, so this parses
@@ -13,6 +14,7 @@ import { envSchema } from "./schema.js";
  */
 const reportEnvSchema = envSchema.pick({
   TRADING_DAY_TZ: true,
+  DIGEST_INTERVAL_MINUTES: true,
   STUCK_WRITE_OFF_MIN: true,
   GOLIVE_MIN_TRADES: true,
   GOLIVE_MIN_DAYS: true,
