@@ -1,4 +1,8 @@
 import type { Db } from "./db.js";
+import { DEFAULT_DETAIL_FIELDS, type PositionDetailFields } from "./positions.js";
+
+/** Sellability loss, dexId and stop poll/confirmation values (SPEC.md section 11.1), copied from the position. */
+export type TradeDetailFields = PositionDetailFields;
 
 /**
  * Live-trade fields (SPEC.md section 11.1). Raw amounts are large-integer
@@ -52,7 +56,7 @@ const TRADE_LIVE_DEFAULTS: TradeLiveFields = {
   proceedsUnknown: false,
 };
 
-export interface TradeRow extends TradeLiveFields {
+export interface TradeRow extends TradeLiveFields, TradeDetailFields {
   id: number;
   mode: string;
   mint: string;
@@ -89,8 +93,8 @@ export interface TradeRow extends TradeLiveFields {
   exitQuoteOutAmount: string | null;
 }
 
-/** Live fields are optional on insert (paper trades omit them). */
-export type NewTradeRow = Omit<TradeRow, "id" | keyof TradeLiveFields> & Partial<TradeLiveFields>;
+/** Live and detail fields are optional on insert (paper trades omit the live ones; detail fields default to null). */
+export type NewTradeRow = Omit<TradeRow, "id" | keyof TradeLiveFields | keyof TradeDetailFields> & Partial<TradeLiveFields> & Partial<TradeDetailFields>;
 
 interface TradeRowDb {
   id: number;
@@ -144,6 +148,11 @@ interface TradeRowDb {
   failed_sell_fees_lamports: number | null;
   failed_sell_fees_usd: number | null;
   proceeds_unknown: number;
+  sellability_loss_pct: number | null;
+  sellability_checked_at: number | null;
+  dex_id: string | null;
+  stop_poll_pnl_pct: number | null;
+  stop_confirm_pnl_pct: number | null;
 }
 
 function fromDb(row: TradeRowDb): TradeRow {
@@ -168,6 +177,11 @@ function fromDb(row: TradeRowDb): TradeRow {
     failedSellFeesLamports: row.failed_sell_fees_lamports,
     failedSellFeesUsd: row.failed_sell_fees_usd,
     proceedsUnknown: row.proceeds_unknown === 1,
+    sellabilityLossPct: row.sellability_loss_pct,
+    sellabilityCheckedAt: row.sellability_checked_at,
+    dexId: row.dex_id,
+    stopPollPnlPct: row.stop_poll_pnl_pct,
+    stopConfirmPnlPct: row.stop_confirm_pnl_pct,
     id: row.id,
     mode: row.mode,
     mint: row.mint,
@@ -249,7 +263,8 @@ export class TradesStore {
           entry_signature, exit_signature, entry_usdc_raw, entry_tokens_raw, exit_tokens_raw, exit_usdc_raw,
           entry_fee_lamports, exit_fee_lamports, entry_fee_usd, exit_fee_usd, rent_paid_lamports, rent_reclaimed_lamports,
           rent_paid_usd, rent_reclaimed_usd, entry_sol_price_usd, exit_sol_price_usd, sell_attempts,
-          failed_sell_fees_lamports, failed_sell_fees_usd, proceeds_unknown
+          failed_sell_fees_lamports, failed_sell_fees_usd, proceeds_unknown,
+          sellability_loss_pct, sellability_checked_at, dex_id, stop_poll_pnl_pct, stop_confirm_pnl_pct
         ) VALUES (@mode, @mint, @symbol, @pair_address, @entry_time, @exit_time, @size_usd, @cost_basis, @proceeds,
           @net_pnl_usd, @net_pnl_pct, @exit_reason, @peak_pnl, @timer_restarts, @target_extensions, @fees_usd,
           @entry_pair_snapshot, @top1_pct, @top10_pct, @score, @score_components, @animal_flag, @trading_day,
@@ -258,10 +273,16 @@ export class TradesStore {
           @entry_signature, @exit_signature, @entry_usdc_raw, @entry_tokens_raw, @exit_tokens_raw, @exit_usdc_raw,
           @entry_fee_lamports, @exit_fee_lamports, @entry_fee_usd, @exit_fee_usd, @rent_paid_lamports, @rent_reclaimed_lamports,
           @rent_paid_usd, @rent_reclaimed_usd, @entry_sol_price_usd, @exit_sol_price_usd, @sell_attempts,
-          @failed_sell_fees_lamports, @failed_sell_fees_usd, @proceeds_unknown)`,
+          @failed_sell_fees_lamports, @failed_sell_fees_usd, @proceeds_unknown,
+          @sellability_loss_pct, @sellability_checked_at, @dex_id, @stop_poll_pnl_pct, @stop_confirm_pnl_pct)`,
       )
       .run({
         ...tradeLiveToDb({ ...TRADE_LIVE_DEFAULTS, ...definedOnly(row) }),
+        sellability_loss_pct: row.sellabilityLossPct ?? DEFAULT_DETAIL_FIELDS.sellabilityLossPct,
+        sellability_checked_at: row.sellabilityCheckedAt ?? DEFAULT_DETAIL_FIELDS.sellabilityCheckedAt,
+        dex_id: row.dexId ?? DEFAULT_DETAIL_FIELDS.dexId,
+        stop_poll_pnl_pct: row.stopPollPnlPct ?? DEFAULT_DETAIL_FIELDS.stopPollPnlPct,
+        stop_confirm_pnl_pct: row.stopConfirmPnlPct ?? DEFAULT_DETAIL_FIELDS.stopConfirmPnlPct,
         mode: row.mode,
         mint: row.mint,
         symbol: row.symbol,

@@ -1,4 +1,5 @@
 import { equalSizeBuckets, maxDrawdown, mean, median, pearsonCorrelation, percentile } from "./stats.js";
+import type { TradeRow } from "../storage/trades.js";
 
 export interface TradeRecord {
   mode: "paper" | "live";
@@ -367,8 +368,12 @@ export interface TradeDetailHistoryPoint {
  */
 export interface TradeDetailRecord {
   id: number;
+  mode: string;
   mint: string;
   symbol: string | null;
+  pairAddress: string | null;
+  dexId: string | null;
+  tradingDay: string;
   entryTime: number;
   exitTime: number;
   sizeUsd: number;
@@ -380,7 +385,22 @@ export interface TradeDetailRecord {
   netPnlPct: number;
   peakPnl: number;
   exitReason: string;
-  entryLiquidityUsd: number | null;
+  timerRestarts: number;
+  targetExtensions: number;
+  feesUsd: number;
+  /** The entry pair snapshot's fields (section 11.1); null when there's no snapshot at all. */
+  entryPair: EntryPairFields | null;
+  top1Pct: number | null;
+  top10Pct: number | null;
+  score: number | null;
+  scoreComponents: Record<string, number> | null;
+  animalFlag: boolean | null;
+  /** Round-trip loss % from the sellability check that admitted the entry, and when it ran. Null on trades recorded before this was stored. */
+  sellabilityLossPct: number | null;
+  sellabilityCheckedAt: number | null;
+  /** Stop exits: the triggering poll's pnlPct and the confirmation's (null = no route). Null on other exits and on trades recorded before this was stored. */
+  stopPollPnlPct: number | null;
+  stopConfirmPnlPct: number | null;
   entryValuationPnlPct: number | null;
   entryQuoteInAmount: string | null;
   entryQuoteOutAmount: string | null;
@@ -413,6 +433,167 @@ export interface TradeDetailRecord {
   };
 }
 
+/** The entry pair snapshot fields section 11.1 lists. Any field the snapshot lacks is null (printed n/a, never 0). */
+export interface EntryPairFields {
+  priceChangeM5: number | null;
+  priceChangeH1: number | null;
+  priceChangeH24: number | null;
+  volumeM5: number | null;
+  volumeH1: number | null;
+  buysM5: number | null;
+  sellsM5: number | null;
+  liquidityUsd: number | null;
+  /** Minutes from pairCreatedAt to the entry. */
+  pairAgeMin: number | null;
+  fdv: number | null;
+}
+
+function finiteOrNull(v: unknown): number | null {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return typeof n === "number" && Number.isFinite(n) ? n : null;
+}
+
+/** Reads section 11.1's snapshot fields out of a stored DexScreener pair (defensively: it's stored JSON). */
+export function entryPairFields(snapshot: unknown, entryTime: number): EntryPairFields | null {
+  if (snapshot === null || typeof snapshot !== "object") return null;
+  const p = snapshot as {
+    priceChange?: Record<string, unknown>;
+    volume?: Record<string, unknown>;
+    txns?: { m5?: { buys?: unknown; sells?: unknown } };
+    liquidity?: { usd?: unknown };
+    pairCreatedAt?: unknown;
+    fdv?: unknown;
+  };
+  const createdAt = finiteOrNull(p.pairCreatedAt);
+  return {
+    priceChangeM5: finiteOrNull(p.priceChange?.m5),
+    priceChangeH1: finiteOrNull(p.priceChange?.h1),
+    priceChangeH24: finiteOrNull(p.priceChange?.h24),
+    volumeM5: finiteOrNull(p.volume?.m5),
+    volumeH1: finiteOrNull(p.volume?.h1),
+    buysM5: finiteOrNull(p.txns?.m5?.buys),
+    sellsM5: finiteOrNull(p.txns?.m5?.sells),
+    liquidityUsd: finiteOrNull(p.liquidity?.usd),
+    pairAgeMin: createdAt !== null ? (entryTime - createdAt) / 60_000 : null,
+    fdv: finiteOrNull(p.fdv),
+  };
+}
+
+function scoreComponentsOf(v: unknown): Record<string, number> | null {
+  if (v === null || typeof v !== "object") return null;
+  const out: Record<string, number> = {};
+  for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+    const n = finiteOrNull(x);
+    if (n !== null) out[k] = n;
+  }
+  return out;
+}
+
+/** A stored trade (plus its trade_history) as the `--trades` report prints it. */
+export function tradeRowToDetailRecord(t: TradeRow, history: readonly TradeDetailHistoryPoint[]): TradeDetailRecord {
+  return {
+    id: t.id,
+    mode: t.mode,
+    mint: t.mint,
+    symbol: t.symbol,
+    pairAddress: t.pairAddress,
+    dexId: t.dexId,
+    tradingDay: t.tradingDay,
+    entryTime: t.entryTime,
+    exitTime: t.exitTime,
+    sizeUsd: t.sizeUsd,
+    costBasis: t.costBasis,
+    tokenAmount: t.tokenAmount,
+    tokenDecimals: t.tokenDecimals,
+    proceeds: t.proceeds,
+    netPnlUsd: t.netPnlUsd,
+    netPnlPct: t.netPnlPct,
+    peakPnl: t.peakPnl,
+    exitReason: t.exitReason,
+    timerRestarts: t.timerRestarts,
+    targetExtensions: t.targetExtensions,
+    feesUsd: t.feesUsd,
+    entryPair: entryPairFields(t.entryPairSnapshot, t.entryTime),
+    top1Pct: t.top1Pct,
+    top10Pct: t.top10Pct,
+    score: t.score,
+    scoreComponents: scoreComponentsOf(t.scoreComponents),
+    animalFlag: t.animalFlag,
+    sellabilityLossPct: t.sellabilityLossPct,
+    sellabilityCheckedAt: t.sellabilityCheckedAt,
+    stopPollPnlPct: t.stopPollPnlPct,
+    stopConfirmPnlPct: t.stopConfirmPnlPct,
+    entryValuationPnlPct: t.entryValuationPnlPct,
+    entryQuoteInAmount: t.entryQuoteInAmount,
+    entryQuoteOutAmount: t.entryQuoteOutAmount,
+    exitQuoteInAmount: t.exitQuoteInAmount,
+    exitQuoteOutAmount: t.exitQuoteOutAmount,
+    history,
+    live: {
+      mode: t.mode,
+      entrySignature: t.entrySignature,
+      exitSignature: t.exitSignature,
+      entryUsdcRaw: t.entryUsdcRaw,
+      entryTokensRaw: t.entryTokensRaw,
+      exitTokensRaw: t.exitTokensRaw,
+      exitUsdcRaw: t.exitUsdcRaw,
+      entryFeeLamports: t.entryFeeLamports,
+      exitFeeLamports: t.exitFeeLamports,
+      entryFeeUsd: t.entryFeeUsd,
+      exitFeeUsd: t.exitFeeUsd,
+      rentPaidLamports: t.rentPaidLamports,
+      rentReclaimedLamports: t.rentReclaimedLamports,
+      rentPaidUsd: t.rentPaidUsd,
+      rentReclaimedUsd: t.rentReclaimedUsd,
+      entrySolPriceUsd: t.entrySolPriceUsd,
+      exitSolPriceUsd: t.exitSolPriceUsd,
+      sellAttempts: t.sellAttempts,
+      failedSellFeesLamports: t.failedSellFeesLamports,
+      failedSellFeesUsd: t.failedSellFeesUsd,
+      proceedsUnknown: t.proceedsUnknown,
+    },
+  };
+}
+
+/** The six score components, in section 6.1's order; any others stored are printed after them. */
+const SCORE_COMPONENT_ORDER = ["buyPressure", "activity", "momentum", "depth", "holders", "freshness"];
+
+function fmtNum(v: number | null, digits: number, prefix = "", suffix = ""): string {
+  return v === null ? "n/a" : `${prefix}${v.toFixed(digits)}${suffix}`;
+}
+
+function fmtEntryPair(p: EntryPairFields | null): string {
+  if (p === null) return "n/a (no snapshot stored)";
+  return [
+    `change m5 ${fmtNum(p.priceChangeM5, 2, "", "%")} h1 ${fmtNum(p.priceChangeH1, 2, "", "%")} h24 ${fmtNum(p.priceChangeH24, 2, "", "%")}`,
+    `volume m5 ${fmtNum(p.volumeM5, 2, "$")} h1 ${fmtNum(p.volumeH1, 2, "$")}`,
+    `m5 buys ${fmtNum(p.buysM5, 0)} sells ${fmtNum(p.sellsM5, 0)}`,
+    `liquidity ${fmtNum(p.liquidityUsd, 2, "$")}`,
+    `pair age ${fmtNum(p.pairAgeMin, 1, "", "m")}`,
+    `fdv ${fmtNum(p.fdv, 0, "$")}`,
+  ].join(" | ");
+}
+
+function fmtScore(score: number | null, components: Record<string, number> | null): string {
+  const head = fmtNum(score, 4);
+  if (components === null) return `${head} (components: n/a)`;
+  const names = [...SCORE_COMPONENT_ORDER, ...Object.keys(components).filter((k) => !SCORE_COMPONENT_ORDER.includes(k))];
+  return `${head} (${names.map((k) => `${k} ${fmtNum(components[k] ?? null, 4)}`).join(", ")})`;
+}
+
+function fmtSellability(lossPct: number | null, checkedAt: number | null, entryTime: number): string {
+  if (checkedAt === null) return "not recorded";
+  const beforeEntrySec = (entryTime - checkedAt) / 1000;
+  return `${fmtNum(lossPct, 2, "", "%")} (checked ${new Date(checkedAt).toISOString()}, ${beforeEntrySec.toFixed(1)}s before entry)`;
+}
+
+function fmtStopConfirmation(exitReason: string, pollPnlPct: number | null, confirmPnlPct: number | null): string {
+  if (exitReason !== "stop") return "n/a (not a stop exit)";
+  if (pollPnlPct === null) return "not recorded";
+  const confirm = confirmPnlPct === null ? "no route (treated as confirmed)" : `${confirmPnlPct.toFixed(2)}%`;
+  return `triggering poll ${pollPnlPct.toFixed(2)}%, confirmation ${confirm}`;
+}
+
 function fmtUsd4(v: number): string {
   return `${v >= 0 ? "" : "-"}$${Math.abs(v).toFixed(4)}`;
 }
@@ -436,8 +617,14 @@ export function formatTradeDetail(trades: readonly TradeDetailRecord[], opts: { 
     lines.push(`=== Trade ${t.id}: ${t.symbol ?? t.mint.slice(0, 6)} (${t.mint}) ===`);
     lines.push(`  entry: ${new Date(t.entryTime).toISOString()}  exit: ${new Date(t.exitTime).toISOString()}  hold: ${holdSec.toFixed(1)}s`);
     lines.push(`  size: $${t.sizeUsd.toFixed(2)}  cost basis: $${t.costBasis.toFixed(4)}  proceeds: $${t.proceeds.toFixed(4)}`);
+    lines.push(`  mode: ${t.mode}  pair: ${t.pairAddress ?? "n/a"}  dex: ${t.dexId ?? "n/a"}  trading day: ${t.tradingDay}`);
     lines.push(`  net PnL: ${fmtUsd4(t.netPnlUsd)} / ${t.netPnlPct.toFixed(2)}%  peak: ${fmtPctOrNa(t.peakPnl)}  exit reason: ${t.exitReason}`);
-    lines.push(`  entry liquidity: ${t.entryLiquidityUsd !== null ? `$${t.entryLiquidityUsd.toFixed(2)}` : "n/a"}`);
+    lines.push(`  timer restarts: ${t.timerRestarts}  target extensions: ${t.targetExtensions}  fees (total): ${fmtUsd4(t.feesUsd)}`);
+    lines.push(`  stop confirmation: ${fmtStopConfirmation(t.exitReason, t.stopPollPnlPct, t.stopConfirmPnlPct)}`);
+    lines.push(`  entry pair: ${fmtEntryPair(t.entryPair)}`);
+    lines.push(`  holders: top1 ${fmtNum(t.top1Pct, 2, "", "%")}  top10 ${fmtNum(t.top10Pct, 2, "", "%")}  animal flag: ${t.animalFlag === null ? "n/a" : String(t.animalFlag)}`);
+    lines.push(`  score: ${fmtScore(t.score, t.scoreComponents)}`);
+    lines.push(`  sellability round-trip loss: ${fmtSellability(t.sellabilityLossPct, t.sellabilityCheckedAt, t.entryTime)}`);
     lines.push(`  tokens received: ${t.tokenAmount ?? "n/a"}  decimals: ${t.tokenDecimals ?? "n/a"}`);
     lines.push(`  entry valuation (first exit-lane quote after fill): ${fmtPctOrNa(t.entryValuationPnlPct)}`);
     lines.push(`  entry quote (raw): ${fmtQuote(t.entryQuoteInAmount, t.entryQuoteOutAmount)}`);

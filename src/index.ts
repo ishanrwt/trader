@@ -24,6 +24,7 @@ import { SlidingWindowLimiter } from "./limiters/slidingWindow.js";
 import { createLogger, type Logger, type LogLevel } from "./logger/index.js";
 import { pollOpenPositions, triggerFireAndForget, type PollPositionInput } from "./monitor/index.js";
 import { finalPeakPnl, initialExitState, type ExitState, type ExitStateMachineConfig } from "./monitor/stateMachine.js";
+import { logStopConfirm, stopCloseFields } from "./monitor/stopConfirm.js";
 import {
   CONSECUTIVE_ERRORS_KEY,
   KILLED_VIA_COMMAND_KEY,
@@ -57,12 +58,13 @@ import { LaneLimiter } from "./limiters/laneLimiter.js";
 import { IntentsStore } from "./storage/intents.js";
 import { FeeLossesStore } from "./storage/feeLosses.js";
 import { modeSwitchRefusal } from "./startup/modeGuard.js";
+import { instanceGuardRefusal, markCleanShutdown, readHeartbeatState } from "./startup/instanceGuard.js";
 import type { TradeExecutor } from "./executor/types.js";
 import type { PositionRow } from "./storage/positions.js";
 import type { TradeLiveFields } from "./storage/trades.js";
 import { ShutdownCoordinator } from "./shutdown.js";
 import { goLiveChecklist } from "./report/index.js";
-import { computePositionSizeUsd, pickNextCandidate, runSlotFilling, type ReadyCandidate } from "./selection/index.js";
+import { computePositionSizeUsd, pickNextCandidate, runSlotFilling, type EntryExecution, type ReadyCandidate, type SellabilityMeasurement } from "./selection/index.js";
 import { computeScore } from "./selection/score.js";
 import { SolPriceTracker } from "./solPrice/index.js";
 import { openDb } from "./storage/db.js";
@@ -74,6 +76,7 @@ import { PostExitTracksStore } from "./storage/postExitTracks.js";
 import { SkipTracksStore } from "./storage/skipTracks.js";
 import { StateStore } from "./storage/state.js";
 import { TradesStore } from "./storage/trades.js";
+import { tradeFromPosition } from "./storage/tradeFromPosition.js";
 import { TradeHistoryStore } from "./storage/tradeHistory.js";
 import { paperEntryFill, paperExitFill, shouldWriteOff } from "./executor/paper.js";
 import { shadowEntry, shadowStep, shadowValue } from "./tracking/shadows.js";
@@ -161,6 +164,14 @@ const SHUTDOWN_WAIT_MS = 120_000;
 let scrubFatal: (text: string) => string = (t) => t;
 
 async function main(): Promise<void> {
+  // SPEC.md section 16.8: before anything else (no config, no logs, no migrations), refuse to
+  // start if another instance may already be running against this folder's database.
+  const instanceRefusal = instanceGuardRefusal(readHeartbeatState(DB_PATH), Date.now());
+  if (instanceRefusal) {
+    console.error(instanceRefusal);
+    process.exit(1);
+  }
+
   const { env, fileKeys } = loadEnv();
 
   let config: Config;
@@ -267,7 +278,9 @@ async function main(): Promise<void> {
   // ---- In-memory caches / trackers (short-lived; a restart naturally invalidates them) ----
   const mintDecimalsCache = new Map<string, number>();
   const holdersCache = new Map<string, { result: HoldersResult; expiresAt: number }>();
-  const sellabilityCache = new Map<string, { passed: boolean; expiresAt: number }>();
+  /** Keyed by `${mint}|${sizeUsd}`: a round-trip loss measured at one size is never reused for another. */
+  const sellabilityCache = new Map<string, { result: SellabilityMeasurement; expiresAt: number }>();
+  const sellabilityCacheKey = (mint: string, sizeUsd: number) => `${mint}|${sizeUsd}`;
   const inFlightEntries = new Set<string>();
   const inFlightExitFills = new Set<number>();
   const pendingLiquidityReadings = new Map<string, number>();
@@ -515,7 +528,9 @@ async function main(): Promise<void> {
       return liveDone && inFlightWork.size === 0;
     },
     finalize: () => {
-      heartbeat(stateStore, Date.now());
+      const stoppedAt = Date.now();
+      heartbeat(stateStore, stoppedAt);
+      markCleanShutdown(stateStore, stoppedAt); // lets an immediate restart past the instance guard
       db.close();
     },
     exit: (code) => process.exit(code),
@@ -628,12 +643,12 @@ async function main(): Promise<void> {
       candidates,
       openPositionsCount: positionsStore.listOpen().length,
       inFlight: inFlightEntries,
-      getSellabilityCache: (mint) => {
-        const c = sellabilityCache.get(mint);
+      getSellabilityCache: (mint, sizeUsd) => {
+        const c = sellabilityCache.get(sellabilityCacheKey(mint, sizeUsd));
         if (!c || c.expiresAt <= now) return undefined;
-        return c.passed;
+        return c.result;
       },
-      setSellabilityCache: (mint, passed) => sellabilityCache.set(mint, { passed, expiresAt: now + 10 * 60_000 }),
+      setSellabilityCache: (mint, sizeUsd, result) => sellabilityCache.set(sellabilityCacheKey(mint, sizeUsd), { result, expiresAt: now + 10 * 60_000 }),
       checkSellability: async (mint, sizeUsd) => {
         try {
           await acquireEntryLane();
@@ -642,10 +657,13 @@ async function main(): Promise<void> {
           await acquireEntryLane();
           const sellQuote = await jupiterClient.getQuote({ inputMint: mint, outputMint: USDC_MINT, amount: buyQuote.outAmount, slippageBps: config.BUY_SLIPPAGE_BPS });
           const usdcBack = Number(sellQuote.outAmount) / 10 ** USDC_DECIMALS;
-          return usdcBack >= (1 - config.MAX_ROUNDTRIP_LOSS_PCT / 100) * sizeUsd;
+          return {
+            passed: usdcBack >= (1 - config.MAX_ROUNDTRIP_LOSS_PCT / 100) * sizeUsd,
+            roundTripLossPct: ((sizeUsd - usdcBack) / sizeUsd) * 100,
+          };
         } catch (err) {
           logger.warn("Sellability check failed", { mint, error: String(err) });
-          return false;
+          return { passed: false, roundTripLossPct: null };
         }
       },
       getExecutionQuote: (mint, sizeUsd) => executor.getExecutionQuote(mint, sizeUsd),
@@ -747,6 +765,7 @@ async function main(): Promise<void> {
           score: candidate.score,
           liquidityUsd: candidate.liquidityUsd,
           snapshot: readyRow?.snapshot ? JSON.parse(readyRow.snapshot) : null,
+          sellability: execution.sellability,
         });
       },
       exitAttempt: (row) => rt.executor.sellAttempt(row),
@@ -779,6 +798,7 @@ async function main(): Promise<void> {
             entryTime: info.entryTime,
             valuationAmountRaw: fill.tokensRaw.toString(),
             exitCostUsd: exitCost,
+            sellability: payload.sellability ?? null,
             live: {
               tokenProgram: fill.tokenAccount?.program ?? payload.tokenProgram,
               tokenAccount: fill.tokenAccount?.address ?? null,
@@ -851,7 +871,7 @@ async function main(): Promise<void> {
     };
   }
 
-  async function openPosition(candidate: ReadyCandidate, execution: { tokens: number; sizeUsd: number }): Promise<void> {
+  async function openPosition(candidate: ReadyCandidate, execution: EntryExecution): Promise<void> {
     const readyRow = pendingStore.listReady().find((r) => r.mint === candidate.mint);
     const snap = readyRow?.snapshot ? (JSON.parse(readyRow.snapshot) as { pair: DexPair; holders: HoldersResult; score: number; components: unknown }) : null;
 
@@ -895,6 +915,7 @@ async function main(): Promise<void> {
       entryTime: Date.now(),
       valuationAmountRaw: Math.round(fill.tokens * 10 ** (tokenDecimals ?? 6)).toString(),
       exitCostUsd: config.PAPER_FEE_USD_PER_TX,
+      sellability: execution.sellability,
     });
   }
 
@@ -918,6 +939,8 @@ async function main(): Promise<void> {
       /** Raw token amount quoted for the entry valuation. */
       valuationAmountRaw: string;
       exitCostUsd: number;
+      /** The sellability check that admitted this entry; null for a recovered buy whose intent predates it. */
+      sellability: { roundTripLossPct: number | null; checkedAt: number } | null;
       live?: Partial<import("./storage/positions.js").PositionLiveFields>;
     },
   ): Promise<number> {
@@ -983,6 +1006,9 @@ async function main(): Promise<void> {
       entryValuationPnlPct,
       entryQuoteInAmount,
       entryQuoteOutAmount,
+      sellabilityLossPct: fill.sellability?.roundTripLossPct ?? null,
+      sellabilityCheckedAt: fill.sellability?.checkedAt ?? null,
+      dexId: snap?.pair.dexId ?? null,
       ...(fill.live ?? {}),
     });
     if (state.history.length > 0) positionsStore.appendHistory(id, state.history[0]!);
@@ -1000,7 +1026,11 @@ async function main(): Promise<void> {
   }
 
   // ---- Monitoring loop (section 8.1) ----
-  function persistExitState(id: number, state: ExitState, extra: Partial<{ status: "open" | "closing"; closingSince: number | null; pendingExitReason: string | null }> = {}) {
+  function persistExitState(
+    id: number,
+    state: ExitState,
+    extra: Partial<{ status: "open" | "closing"; closingSince: number | null; pendingExitReason: string | null; stopPollPnlPct: number | null; stopConfirmPnlPct: number | null }> = {},
+  ) {
     positionsStore.update(id, {
       peakPnl: state.peakPnl,
       currentTarget: state.currentTarget,
@@ -1067,11 +1097,12 @@ async function main(): Promise<void> {
         }
         for (const l of logs) logEvent(db, now, l, `${l} for position ${id}`);
       },
-      onSell: (id, reason, newState) => {
+      onStopCheck: (id, check) => logStopConfirm(db, now, id, check),
+      onSell: (id, reason, newState, stopCheck) => {
         // Marked "closing" (persisted) BEFORE the fill attempt is even kicked off below,
         // so the very next poll sees status='closing' and can never decide a second sell
         // for this position — pollOpenPositions only iterates positionsStore.listOpen().
-        persistExitState(id, newState, { status: "closing", closingSince: now, pendingExitReason: reason });
+        persistExitState(id, newState, { status: "closing", closingSince: now, pendingExitReason: reason, ...stopCloseFields(reason, stopCheck) });
         logEvent(db, now, "sell_decided", `Position ${id} decided SELL (${reason})`, { id, reason });
         const row = positionsStore.get(id);
         if (row) triggerExitFillAttempt(row);
@@ -1159,42 +1190,9 @@ async function main(): Promise<void> {
     const tradingDay = tradingDayKey(now, config.TRADING_DAY_TZ);
 
     const entrySnapshot = row.entryPairSnapshot as DexPair | null;
-    const holders = row.holdersResult as HoldersResult | null;
-
-    const tradeId = tradesStore.insert({
-      mode: row.mode,
-      mint: row.mint,
-      symbol: row.symbol,
-      pairAddress: row.pairAddress,
-      entryTime: row.entryTime,
-      exitTime: now,
-      sizeUsd: row.sizeUsd,
-      costBasis: row.costBasis,
-      proceeds,
-      netPnlUsd,
-      netPnlPct,
-      exitReason,
-      peakPnl: finalPeakPnl(row.peakPnl, netPnlPct),
-      timerRestarts: row.timerRestarts,
-      targetExtensions: row.targetExtensions,
-      feesUsd: extras.feesUsd ?? config.PAPER_FEE_USD_PER_TX * 2,
-      entryPairSnapshot: entrySnapshot,
-      top1Pct: holders?.top1Pct ?? null,
-      top10Pct: holders?.top10Pct ?? null,
-      score: row.score,
-      scoreComponents: row.scoreComponents,
-      animalFlag: null,
-      tradingDay,
-      tokenAmount: row.tokenAmount,
-      tokenDecimals: row.tokenDecimals,
-      entryValuationPnlPct: row.entryValuationPnlPct,
-      entryQuoteInAmount: row.entryQuoteInAmount,
-      entryQuoteOutAmount: row.entryQuoteOutAmount,
-      exitQuoteInAmount: exitQuote.exitQuoteInAmount,
-      exitQuoteOutAmount: exitQuote.exitQuoteOutAmount,
-      ...(extras.tradeLive ?? {}),
-      proceedsUnknown: extras.proceedsUnknown ?? false,
-    });
+    const tradeId = tradesStore.insert(
+      tradeFromPosition({ row, proceeds, exitReason, exitTime: now, tradingDay, exitQuote, defaultFeesUsd: config.PAPER_FEE_USD_PER_TX * 2, extras }),
+    );
 
     // Preserve position_history past the close (SPEC.md sections 11.1/12) — copied, not
     // deleted, before positionsStore.remove() deletes the live position_history rows.

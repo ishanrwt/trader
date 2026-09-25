@@ -44,6 +44,8 @@ export interface BuyIntentPayload {
   decimals: number;
   /** The pending row's snapshot JSON (pair, holders, score, components) at decision time. */
   snapshot: unknown;
+  /** The sellability check that admitted this entry (section 11.1). Optional: intents written before it existed lack it. */
+  sellability?: { roundTripLossPct: number | null; checkedAt: number };
 }
 
 /** The app side (src/index.ts) of the live executor: anything that touches positions, trades, alerts or lanes. */

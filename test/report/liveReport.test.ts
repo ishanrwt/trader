@@ -59,7 +59,10 @@ describe("report: proceeds_unknown trades and fee losses (SPEC.md sections 11.4,
     const text = formatTradeDetail([
       {
         id: 1, mint: "M", symbol: "S", entryTime: 0, exitTime: 1000, sizeUsd: 25, costBasis: 25.3, tokenAmount: 1, tokenDecimals: 6, proceeds: 0, netPnlUsd: -25.3,
-        netPnlPct: -100, peakPnl: 0, exitReason: "reconciled", entryLiquidityUsd: null, entryValuationPnlPct: null, entryQuoteInAmount: null, entryQuoteOutAmount: null,
+        netPnlPct: -100, peakPnl: 0, exitReason: "reconciled", entryValuationPnlPct: null,
+        mode: "live", pairAddress: "PAIR", dexId: "raydium", tradingDay: "2026-09-25", timerRestarts: 0, targetExtensions: 0, feesUsd: 0.000777, entryPair: null,
+        top1Pct: null, top10Pct: null, score: null, scoreComponents: null, animalFlag: null, sellabilityLossPct: null, sellabilityCheckedAt: null,
+        stopPollPnlPct: null, stopConfirmPnlPct: null, entryQuoteInAmount: null, entryQuoteOutAmount: null,
         exitQuoteInAmount: null, exitQuoteOutAmount: null, history: [],
         live: {
           mode: "live", entrySignature: "ENTRYSIG", exitSignature: null, entryUsdcRaw: "25000000", entryTokensRaw: "990000", exitTokensRaw: null, exitUsdcRaw: null,

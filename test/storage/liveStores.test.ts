@@ -54,8 +54,8 @@ describe("migration 0004_live", () => {
       const state = new StateStore(db);
       state.set("lossStreak", 3);
       state.set("dailyLossHaltDay", "2026-09-24");
-      runMigrations(db); // now applies 0004
-      expect(db.pragma("user_version", { simple: true })).toBe(4);
+      runMigrations(db); // now applies 0004 (and any later migrations)
+      expect(db.pragma("user_version", { simple: true })).toBeGreaterThanOrEqual(4);
       expect(state.get("lossStreak:paper", 0)).toBe(3);
       expect(state.get("dailyLossHaltDay:paper", null)).toBe("2026-09-24");
       expect(state.get("lossStreak:live", 0)).toBe(0);

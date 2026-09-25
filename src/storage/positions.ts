@@ -52,7 +52,32 @@ export const DEFAULT_LIVE_FIELDS: PositionLiveFields = {
   closeAta: true,
 };
 
-export interface PositionRow extends PositionLiveFields {
+/**
+ * Per-trade detail carried on the position until the trade is recorded
+ * (SPEC.md sections 8.3, 11.1). Optional on insert; each defaults to null.
+ */
+export interface PositionDetailFields {
+  /** Round-trip loss % measured by the sellability check that admitted this entry (section 6.2). */
+  sellabilityLossPct: number | null;
+  /** When that sellability check ran (it may be a cached result from before the entry). */
+  sellabilityCheckedAt: number | null;
+  /** The entry pair's DexScreener dexId. */
+  dexId: string | null;
+  /** Stop exits only: the pnlPct of the poll that triggered the stop. */
+  stopPollPnlPct: number | null;
+  /** Stop exits only: the confirmation quote's pnlPct; null if that quote had no route (treated as confirmed). */
+  stopConfirmPnlPct: number | null;
+}
+
+export const DEFAULT_DETAIL_FIELDS: PositionDetailFields = {
+  sellabilityLossPct: null,
+  sellabilityCheckedAt: null,
+  dexId: null,
+  stopPollPnlPct: null,
+  stopConfirmPnlPct: null,
+};
+
+export interface PositionRow extends PositionLiveFields, PositionDetailFields {
   id: number;
   mode: string;
   mint: string;
@@ -147,6 +172,11 @@ interface PositionRowDb {
   stuck_since: number | null;
   next_sell_at: number | null;
   close_ata: number;
+  sellability_loss_pct: number | null;
+  sellability_checked_at: number | null;
+  dex_id: string | null;
+  stop_poll_pnl_pct: number | null;
+  stop_confirm_pnl_pct: number | null;
 }
 
 function fromDb(row: PositionRowDb): PositionRow {
@@ -168,6 +198,11 @@ function fromDb(row: PositionRowDb): PositionRow {
     stuckSince: row.stuck_since,
     nextSellAt: row.next_sell_at,
     closeAta: row.close_ata === 1,
+    sellabilityLossPct: row.sellability_loss_pct,
+    sellabilityCheckedAt: row.sellability_checked_at,
+    dexId: row.dex_id,
+    stopPollPnlPct: row.stop_poll_pnl_pct,
+    stopConfirmPnlPct: row.stop_confirm_pnl_pct,
     id: row.id,
     mode: row.mode,
     mint: row.mint,
@@ -206,13 +241,30 @@ function fromDb(row: PositionRowDb): PositionRow {
   };
 }
 
-/** Live fields are optional on insert (paper positions omit them; they default per DEFAULT_LIVE_FIELDS). */
-export type NewPositionRow = Omit<PositionRow, "id" | keyof PositionLiveFields> & Partial<PositionLiveFields>;
-/** tokenDecimals/entryValuationPnlPct/entryQuote* are write-once at insert time, like mode/mint/entryTime — update() never touches them. */
+/** Live and detail fields are optional on insert (they default per DEFAULT_LIVE_FIELDS / DEFAULT_DETAIL_FIELDS). */
+export type NewPositionRow = Omit<PositionRow, "id" | keyof PositionLiveFields | keyof PositionDetailFields> &
+  Partial<PositionLiveFields> &
+  Partial<PositionDetailFields>;
+/**
+ * tokenDecimals/entryValuationPnlPct/entryQuote*, the sellability measurement and dexId are write-once at
+ * insert time, like mode/mint/entryTime — update() never touches them. The stop poll/confirmation values are
+ * set when a stop is decided.
+ */
 export type PositionPatch = Partial<
   Omit<
     PositionRow,
-    "id" | "mode" | "mint" | "entryTime" | "tokenDecimals" | "entryValuationPnlPct" | "entryQuoteInAmount" | "entryQuoteOutAmount" | keyof PositionLiveFields
+    | "id"
+    | "mode"
+    | "mint"
+    | "entryTime"
+    | "tokenDecimals"
+    | "entryValuationPnlPct"
+    | "entryQuoteInAmount"
+    | "entryQuoteOutAmount"
+    | "sellabilityLossPct"
+    | "sellabilityCheckedAt"
+    | "dexId"
+    | keyof PositionLiveFields
   >
 >;
 
@@ -236,7 +288,8 @@ export class PositionsStore {
           token_decimals, entry_valuation_pnl_pct, entry_quote_in_amount, entry_quote_out_amount,
           token_program, token_account, token_amount_raw, entry_signature, entry_usdc_raw, entry_fee_lamports,
           entry_rent_lamports, entry_sol_price_usd, sell_attempts, sell_failures, sell_fees_lamports,
-          failed_sell_fees_lamports, sell_budget_lamports, stuck_state, stuck_since, next_sell_at, close_ata
+          failed_sell_fees_lamports, sell_budget_lamports, stuck_state, stuck_since, next_sell_at, close_ata,
+          sellability_loss_pct, sellability_checked_at, dex_id, stop_poll_pnl_pct, stop_confirm_pnl_pct
         ) VALUES (@mode, @mint, @symbol, @pair_address, @status, @entry_time, @size_usd, @token_amount, @cost_basis,
           @entry_liquidity_usd, @entry_pair_snapshot, @score, @score_components, @safety_result, @holders_result,
           @peak_pnl, @current_target, @target_extensions, @timer_restarts, @last_restart_at, @deadline,
@@ -244,10 +297,12 @@ export class PositionsStore {
           @token_decimals, @entry_valuation_pnl_pct, @entry_quote_in_amount, @entry_quote_out_amount,
           @token_program, @token_account, @token_amount_raw, @entry_signature, @entry_usdc_raw, @entry_fee_lamports,
           @entry_rent_lamports, @entry_sol_price_usd, @sell_attempts, @sell_failures, @sell_fees_lamports,
-          @failed_sell_fees_lamports, @sell_budget_lamports, @stuck_state, @stuck_since, @next_sell_at, @close_ata)`,
+          @failed_sell_fees_lamports, @sell_budget_lamports, @stuck_state, @stuck_since, @next_sell_at, @close_ata,
+          @sellability_loss_pct, @sellability_checked_at, @dex_id, @stop_poll_pnl_pct, @stop_confirm_pnl_pct)`,
       )
       .run({
         ...liveToDb({ ...DEFAULT_LIVE_FIELDS, ...pickLive(row) }),
+        ...detailToDb({ ...DEFAULT_DETAIL_FIELDS, ...pickDetail(row) }),
         mode: row.mode,
         mint: row.mint,
         symbol: row.symbol,
@@ -315,7 +370,8 @@ export class PositionsStore {
           timer_restarts=@timer_restarts, last_restart_at=@last_restart_at, deadline=@deadline,
           trail_armed=@trail_armed, fast_streak=@fast_streak, low_liq_streak=@low_liq_streak,
           no_route_since=@no_route_since, closing_since=@closing_since, pending_exit_reason=@pending_exit_reason, last_pnl_pct=@last_pnl_pct,
-          last_value_usd=@last_value_usd, last_polled_at=@last_polled_at
+          last_value_usd=@last_value_usd, last_polled_at=@last_polled_at,
+          stop_poll_pnl_pct=@stop_poll_pnl_pct, stop_confirm_pnl_pct=@stop_confirm_pnl_pct
         WHERE id=@id`,
       )
       .run({
@@ -342,6 +398,8 @@ export class PositionsStore {
         last_pnl_pct: next.lastPnlPct,
         last_value_usd: next.lastValueUsd,
         last_polled_at: next.lastPolledAt,
+        stop_poll_pnl_pct: next.stopPollPnlPct,
+        stop_confirm_pnl_pct: next.stopConfirmPnlPct,
       });
   }
 
@@ -405,6 +463,24 @@ function pickLive(row: Partial<PositionLiveFields>): Partial<PositionLiveFields>
   const out: Partial<PositionLiveFields> = {};
   for (const k of LIVE_KEYS) if (row[k] !== undefined) (out as Record<string, unknown>)[k] = row[k];
   return out;
+}
+
+const DETAIL_KEYS = Object.keys(DEFAULT_DETAIL_FIELDS) as Array<keyof PositionDetailFields>;
+
+function pickDetail(row: Partial<PositionDetailFields>): Partial<PositionDetailFields> {
+  const out: Partial<PositionDetailFields> = {};
+  for (const k of DETAIL_KEYS) if (row[k] !== undefined) (out as Record<string, unknown>)[k] = row[k];
+  return out;
+}
+
+function detailToDb(f: PositionDetailFields): Record<string, unknown> {
+  return {
+    sellability_loss_pct: f.sellabilityLossPct,
+    sellability_checked_at: f.sellabilityCheckedAt,
+    dex_id: f.dexId,
+    stop_poll_pnl_pct: f.stopPollPnlPct,
+    stop_confirm_pnl_pct: f.stopConfirmPnlPct,
+  };
 }
 
 function liveToDb(f: PositionLiveFields): Record<string, unknown> {

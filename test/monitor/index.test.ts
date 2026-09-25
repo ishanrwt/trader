@@ -51,6 +51,52 @@ describe("pollPosition", () => {
     const outcome = await pollPosition({ id: 1, state: state(), fetchPnlPct }, 1000, CFG);
     expect(outcome.result).toMatchObject({ action: "SELL", reason: "stop" });
   });
+
+  it("stopCheck: a confirmed stop reports both pnlPcts and confirmed=true", async () => {
+    const fetchPnlPct = vi.fn().mockResolvedValueOnce(-16).mockResolvedValueOnce(-17.5);
+    const outcome = await pollPosition({ id: 1, state: state(), fetchPnlPct }, 1000, CFG);
+    expect(outcome.result).toMatchObject({ action: "SELL", reason: "stop" });
+    expect(outcome.stopCheck).toEqual({ pollPnlPct: -16, confirmPnlPct: -17.5, confirmed: true });
+  });
+
+  it("stopCheck: a confirmation that disagrees reports confirmed=false and the position is held", async () => {
+    const fetchPnlPct = vi.fn().mockResolvedValueOnce(-16).mockResolvedValueOnce(-5);
+    const outcome = await pollPosition({ id: 1, state: state(), fetchPnlPct }, 1000, CFG);
+    expect(outcome.result.action).toBe("HOLD");
+    expect(outcome.stopCheck).toEqual({ pollPnlPct: -16, confirmPnlPct: -5, confirmed: false });
+  });
+
+  it("stopCheck: a no-route confirmation is reported as null (not -Infinity) and confirmed", async () => {
+    const fetchPnlPct = vi.fn().mockResolvedValueOnce(-16).mockResolvedValueOnce(null);
+    const outcome = await pollPosition({ id: 1, state: state(), fetchPnlPct }, 1000, CFG);
+    expect(outcome.stopCheck).toEqual({ pollPnlPct: -16, confirmPnlPct: null, confirmed: true });
+  });
+
+  it("stopCheck: absent when the poll never hit the stop", async () => {
+    const outcome = await pollPosition({ id: 1, state: state(), fetchPnlPct: async () => 5 }, 1000, CFG);
+    expect(outcome.stopCheck).toBeUndefined();
+  });
+});
+
+describe("pollOpenPositions: stop confirmations", () => {
+  it("fires onStopCheck for confirmed and unconfirmed stops, passes stopCheck to onSell, and nothing for other polls", async () => {
+    const onStopCheck = vi.fn();
+    const onSell = vi.fn();
+    const onHold = vi.fn().mockResolvedValue(undefined);
+    const positions: PollPositionInput[] = [
+      { id: 1, state: state(), fetchPnlPct: vi.fn().mockResolvedValueOnce(-16).mockResolvedValueOnce(-18) }, // confirmed stop
+      { id: 2, state: state(), fetchPnlPct: vi.fn().mockResolvedValueOnce(-16).mockResolvedValueOnce(-4) }, // not confirmed, held
+      { id: 3, state: state(), fetchPnlPct: async () => 5 }, // no stop at all
+    ];
+    await pollOpenPositions({ positions, now: 1000, cfg: CFG, onHold, onSell, onStopCheck, logger: createMemoryLogger() });
+
+    expect(onStopCheck).toHaveBeenCalledTimes(2);
+    expect(onStopCheck).toHaveBeenCalledWith(1, { pollPnlPct: -16, confirmPnlPct: -18, confirmed: true });
+    expect(onStopCheck).toHaveBeenCalledWith(2, { pollPnlPct: -16, confirmPnlPct: -4, confirmed: false });
+    expect(onSell).toHaveBeenCalledWith(1, "stop", expect.anything(), { pollPnlPct: -16, confirmPnlPct: -18, confirmed: true });
+    expect(onHold).toHaveBeenCalledWith(2, expect.anything(), expect.anything());
+    expect(onHold).toHaveBeenCalledWith(3, expect.anything(), expect.anything());
+  });
 });
 
 describe("pollOpenPositions", () => {
@@ -74,7 +120,7 @@ describe("pollOpenPositions", () => {
 
     await pollOpenPositions({ positions, now: 1000, cfg: CFG, onHold, onSell, logger: createMemoryLogger() });
 
-    expect(onSell).toHaveBeenCalledWith(1, "target", expect.anything());
+    expect(onSell).toHaveBeenCalledWith(1, "target", expect.anything(), undefined); // no stop confirmation for a target exit
     expect(onHold).toHaveBeenCalledWith(2, expect.anything(), expect.anything());
     expect(sellFillResolved).toBe(false); // pollOpenPositions returned without waiting for the fill
   });

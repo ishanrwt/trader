@@ -38,6 +38,24 @@ export function computePositionSizeUsd(positionUsd: number, liquidityUsd: number
   return Math.min(positionUsd, liquidityUsd * (maxPositionPctOfLiq / 100));
 }
 
+/** One sellability check (section 6.2): pass/fail plus the measured round-trip loss (null if the check errored). */
+export interface SellabilityResult {
+  passed: boolean;
+  roundTripLossPct: number | null;
+}
+
+/** A sellability result as cached and carried into the entry: what was measured, and when (SPEC.md section 11.1). */
+export interface SellabilityMeasurement extends SellabilityResult {
+  checkedAt: number;
+}
+
+/** What slot filling hands the executor for one entry. */
+export interface EntryExecution {
+  tokens: number;
+  sizeUsd: number;
+  sellability: { roundTripLossPct: number | null; checkedAt: number };
+}
+
 export interface SlotFillingDeps {
   now: number;
   maxConcurrent: number;
@@ -48,17 +66,21 @@ export interface SlotFillingDeps {
   openPositionsCount: number;
   /** Mints with an entry attempt already under way; mutated as attempts start/finish. */
   inFlight: Set<string>;
-  getSellabilityCache: (mint: string, now: number) => boolean | undefined;
-  setSellabilityCache: (mint: string, passed: boolean, now: number) => void;
+  /**
+   * Keyed by mint AND size: the round-trip loss depends on the size quoted, so a
+   * measurement taken at one size is never reused for an entry at another.
+   */
+  getSellabilityCache: (mint: string, sizeUsd: number, now: number) => SellabilityMeasurement | undefined;
+  setSellabilityCache: (mint: string, sizeUsd: number, result: SellabilityMeasurement, now: number) => void;
   /** Jupiter entry lane: USDC->token then token->USDC round trip. */
-  checkSellability: (mint: string, sizeUsd: number) => Promise<boolean>;
+  checkSellability: (mint: string, sizeUsd: number) => Promise<SellabilityResult>;
   /** Jupiter entry lane: the execution quote used for the drift check and the fill. */
   getExecutionQuote: (mint: string, sizeUsd: number) => Promise<{ tokensOut: number } | null>;
   positionSizeUsd: (candidate: ReadyCandidate) => number;
   paperFeeUsdPerTx: number;
   canAfford: (usdcAmount: number) => boolean;
   /** Kicks off the paper entry fill; not awaited inline (mirrors the exit-fill non-blocking rule — see monitor/index.ts). */
-  openPosition: (candidate: ReadyCandidate, execution: { tokens: number; sizeUsd: number }) => Promise<void>;
+  openPosition: (candidate: ReadyCandidate, execution: EntryExecution) => Promise<void>;
   /** Removes the mint from pending (section 4) and marks its shadow unsellable (section 11.2). */
   markUnsellable: (mint: string) => void;
   entryBlocked: () => boolean;
@@ -90,12 +112,12 @@ export async function runSlotFilling(deps: SlotFillingDeps): Promise<void> {
 
     const sizeUsd = deps.positionSizeUsd(pick);
 
-    let sellabilityPassed = deps.getSellabilityCache(pick.mint, deps.now);
-    if (sellabilityPassed === undefined) {
-      sellabilityPassed = await deps.checkSellability(pick.mint, sizeUsd);
-      deps.setSellabilityCache(pick.mint, sellabilityPassed, deps.now);
+    let sellability = deps.getSellabilityCache(pick.mint, sizeUsd, deps.now);
+    if (sellability === undefined) {
+      sellability = { ...(await deps.checkSellability(pick.mint, sizeUsd)), checkedAt: deps.now };
+      deps.setSellabilityCache(pick.mint, sizeUsd, sellability, deps.now);
     }
-    if (!sellabilityPassed) {
+    if (!sellability.passed) {
       deps.markUnsellable(pick.mint); // permanent failure; falls through to the next candidate
       continue;
     }
@@ -120,7 +142,11 @@ export async function runSlotFilling(deps: SlotFillingDeps): Promise<void> {
     deps.inFlight.add(pick.mint);
     openCount += 1; // reserve the slot so the next loop iteration doesn't double-fill it
     void deps
-      .openPosition(pick, { tokens: execQuote.tokensOut, sizeUsd })
+      .openPosition(pick, {
+        tokens: execQuote.tokensOut,
+        sizeUsd,
+        sellability: { roundTripLossPct: sellability.roundTripLossPct, checkedAt: sellability.checkedAt },
+      })
       .catch((err) => deps.logger.error("Slot filling: open position failed", { mint: pick.mint, error: String(err) }))
       .finally(() => deps.inFlight.delete(pick.mint));
   }

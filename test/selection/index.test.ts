@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { computePositionSizeUsd, pickNextCandidate, runSlotFilling, type ReadyCandidate, type SlotFillingDeps } from "../../src/selection/index.js";
+import {
+  computePositionSizeUsd,
+  pickNextCandidate,
+  runSlotFilling,
+  type ReadyCandidate,
+  type SellabilityMeasurement,
+  type SlotFillingDeps,
+} from "../../src/selection/index.js";
 import { createMemoryLogger } from "../../src/logger/index.js";
 
 function candidate(overrides: Partial<ReadyCandidate> = {}): ReadyCandidate {
@@ -77,7 +84,7 @@ function baseDeps(overrides: Partial<SlotFillingDeps> = {}): SlotFillingDeps {
     inFlight: new Set(),
     getSellabilityCache: () => undefined,
     setSellabilityCache: () => {},
-    checkSellability: vi.fn().mockResolvedValue(true),
+    checkSellability: vi.fn().mockResolvedValue({ passed: true, roundTripLossPct: 2.5 }),
     getExecutionQuote: vi.fn().mockResolvedValue({ tokensOut: 1000 }),
     positionSizeUsd: () => 25,
     paperFeeUsdPerTx: 0.05,
@@ -95,7 +102,11 @@ describe("runSlotFilling", () => {
     const openPosition = vi.fn().mockResolvedValue(undefined);
     const deps = baseDeps({ candidates: [candidate({ mint: "A" })], openPosition });
     await runSlotFilling(deps);
-    expect(openPosition).toHaveBeenCalledWith(expect.objectContaining({ mint: "A" }), { tokens: 1000, sizeUsd: 25 });
+    expect(openPosition).toHaveBeenCalledWith(expect.objectContaining({ mint: "A" }), {
+      tokens: 1000,
+      sizeUsd: 25,
+      sellability: { roundTripLossPct: 2.5, checkedAt: 1000 },
+    });
   });
 
   it("checks affordability against size + PAPER_FEE_USD_PER_TX, not size alone", async () => {
@@ -115,7 +126,7 @@ describe("runSlotFilling", () => {
   it("a failed sellability check is permanent and falls through to the next candidate", async () => {
     const markUnsellable = vi.fn();
     const openPosition = vi.fn().mockResolvedValue(undefined);
-    const checkSellability = vi.fn().mockImplementation(async (mint: string) => mint !== "BAD");
+    const checkSellability = vi.fn().mockImplementation(async (mint: string) => ({ passed: mint !== "BAD", roundTripLossPct: mint === "BAD" ? 40 : 3 }));
     const deps = baseDeps({
       candidates: [candidate({ mint: "BAD", score: 0.9 }), candidate({ mint: "GOOD", score: 0.1 })],
       checkSellability,
@@ -127,18 +138,54 @@ describe("runSlotFilling", () => {
     expect(openPosition).toHaveBeenCalledWith(expect.objectContaining({ mint: "GOOD" }), expect.anything());
   });
 
-  it("a sellability pass is cached and not re-checked", async () => {
-    const checkSellability = vi.fn().mockResolvedValue(true);
-    const cache = new Map<string, boolean>();
+  it("a sellability pass is cached with its measured loss and check time", async () => {
+    const checkSellability = vi.fn().mockResolvedValue({ passed: true, roundTripLossPct: 2.5 });
+    const cache = new Map<string, SellabilityMeasurement>();
     const deps = baseDeps({
       candidates: [candidate({ mint: "A" })],
       checkSellability,
-      getSellabilityCache: (mint) => cache.get(mint),
-      setSellabilityCache: (mint, passed) => cache.set(mint, passed),
+      getSellabilityCache: (mint, sizeUsd) => cache.get(`${mint}|${sizeUsd}`),
+      setSellabilityCache: (mint, sizeUsd, result) => cache.set(`${mint}|${sizeUsd}`, result),
     });
     await runSlotFilling(deps);
     expect(checkSellability).toHaveBeenCalledTimes(1);
-    expect(cache.get("A")).toBe(true);
+    expect(cache.get("A|25")).toEqual({ passed: true, roundTripLossPct: 2.5, checkedAt: 1000 });
+  });
+
+  it("a cache hit is not re-checked and carries the cached loss and original check time into the entry", async () => {
+    const checkSellability = vi.fn();
+    const openPosition = vi.fn().mockResolvedValue(undefined);
+    const deps = baseDeps({
+      now: 5000,
+      candidates: [candidate({ mint: "A", lastCheckedAt: 5000 })],
+      checkSellability,
+      getSellabilityCache: () => ({ passed: true, roundTripLossPct: 4.2, checkedAt: 1234 }),
+      openPosition,
+    });
+    await runSlotFilling(deps);
+    expect(checkSellability).not.toHaveBeenCalled();
+    expect(openPosition).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ sellability: { roundTripLossPct: 4.2, checkedAt: 1234 } }));
+  });
+
+  it("the sellability cache is looked up by mint AND size: a loss measured at another size is never reused", async () => {
+    const cache = new Map<string, SellabilityMeasurement>([["A|25", { passed: true, roundTripLossPct: 2.5, checkedAt: 500 }]]);
+    const getSellabilityCache = vi.fn((mint: string, sizeUsd: number) => cache.get(`${mint}|${sizeUsd}`));
+    const checkSellability = vi.fn().mockResolvedValue({ passed: true, roundTripLossPct: 6.1 });
+    const openPosition = vi.fn().mockResolvedValue(undefined);
+    const deps = baseDeps({
+      candidates: [candidate({ mint: "A" })],
+      positionSizeUsd: () => 10, // e.g. POSITION_USD changed, or liquidity now caps the size
+      getExecutionQuote: vi.fn().mockResolvedValue({ tokensOut: 400 }),
+      getSellabilityCache,
+      setSellabilityCache: (mint, sizeUsd, result) => cache.set(`${mint}|${sizeUsd}`, result),
+      checkSellability,
+      openPosition,
+    });
+    await runSlotFilling(deps);
+    expect(getSellabilityCache).toHaveBeenCalledWith("A", 10, 1000);
+    expect(checkSellability).toHaveBeenCalledWith("A", 10);
+    expect(openPosition).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ sizeUsd: 10, sellability: { roundTripLossPct: 6.1, checkedAt: 1000 } }));
+    expect(cache.get("A|25")?.roundTripLossPct).toBe(2.5); // the other size's entry is untouched
   });
 
   it("drift skip: an implied price beyond MAX_ENTRY_DRIFT_PCT is skipped (temporary), not opened", async () => {

@@ -13,8 +13,9 @@ import type { TxRpc } from "./txRpc.js";
 /** SPEC.md section 16 constants: smoke-live swaps exactly 1 USDC. */
 export const SMOKE_USDC_RAW = 1_000_000n;
 export const SMOKE_CONFIRM_PHRASE = "send 1 usdc";
-/** A heartbeat younger than this means a bot is running from this same folder. */
-export const HEARTBEAT_FRESH_MS = 2 * 60_000;
+import { HEARTBEAT_FRESH_MS } from "../startup/instanceGuard.js";
+/** A heartbeat younger than this means a bot is running from this same folder (shared with the bot's startup guard). */
+export { HEARTBEAT_FRESH_MS };
 
 export interface SmokeDeps {
   config: Config;

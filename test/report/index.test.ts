@@ -270,7 +270,34 @@ function tradeDetail(overrides: Partial<TradeDetailRecord> = {}): TradeDetailRec
     netPnlPct: -20.746,
     peakPnl: -3.2,
     exitReason: "stop",
-    entryLiquidityUsd: 54_801.61,
+    mode: "paper",
+    pairAddress: "PAIR1",
+    dexId: "pumpswap",
+    tradingDay: "2026-01-01",
+    timerRestarts: 0,
+    targetExtensions: 0,
+    feesUsd: 0.1,
+    entryPair: {
+      priceChangeM5: 12,
+      priceChangeH1: 40,
+      priceChangeH24: 40,
+      volumeM5: 1000,
+      volumeH1: 5000,
+      buysM5: 100,
+      sellsM5: 50,
+      liquidityUsd: 54_801.61,
+      pairAgeMin: 20,
+      fdv: 200_000,
+    },
+    top1Pct: 2,
+    top10Pct: 15,
+    score: 0.7,
+    scoreComponents: { buyPressure: 0.6, activity: 1, momentum: 0.5, depth: 0.4, holders: 0.7, freshness: 0.9 },
+    animalFlag: null,
+    sellabilityLossPct: 3.1,
+    sellabilityCheckedAt: 500,
+    stopPollPnlPct: -16,
+    stopConfirmPnlPct: -17,
     entryValuationPnlPct: -3.2,
     entryQuoteInAmount: "25000000",
     entryQuoteOutAmount: "68306482910",
@@ -307,14 +334,14 @@ describe("formatTradeDetail", () => {
         entryQuoteOutAmount: null,
         exitQuoteInAmount: null,
         exitQuoteOutAmount: null,
-        entryLiquidityUsd: null,
+        entryPair: null,
         history: [],
       }),
     ]);
     expect(text).toContain("tokens received: n/a  decimals: n/a");
     expect(text).toContain("entry valuation (first exit-lane quote after fill): n/a");
     expect(text).toContain("entry quote (raw): n/a (no successful quote)");
-    expect(text).toContain("entry liquidity: n/a");
+    expect(text).toContain("entry pair: n/a (no snapshot stored)");
     expect(text).toContain("history (first 5 of 0): none");
   });
 

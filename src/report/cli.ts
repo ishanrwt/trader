@@ -1,7 +1,7 @@
 import path from "node:path";
 import { loadEnv } from "../config/loadEnv.js";
 import { loadReportConfig, ReportConfigError } from "../config/reportConfig.js";
-import { formatReport, formatTradeDetail, type TradeDetailRecord, type TradeRecord } from "./index.js";
+import { formatReport, formatTradeDetail, tradeRowToDetailRecord, type TradeRecord } from "./index.js";
 import { openDb } from "../storage/db.js";
 import { TradesStore } from "../storage/trades.js";
 import { TradeHistoryStore } from "../storage/tradeHistory.js";
@@ -62,55 +62,7 @@ function main(): void {
 
   if (opts.trades) {
     const rows = tradesStore.listAll({ ...(opts.mode ? { mode: opts.mode } : {}), ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) });
-    const detail: TradeDetailRecord[] = rows.map((t) => {
-      const snapshot = t.entryPairSnapshot as DexPair | null;
-      return {
-        id: t.id,
-        mint: t.mint,
-        symbol: t.symbol,
-        entryTime: t.entryTime,
-        exitTime: t.exitTime,
-        sizeUsd: t.sizeUsd,
-        costBasis: t.costBasis,
-        tokenAmount: t.tokenAmount,
-        tokenDecimals: t.tokenDecimals,
-        proceeds: t.proceeds,
-        netPnlUsd: t.netPnlUsd,
-        netPnlPct: t.netPnlPct,
-        peakPnl: t.peakPnl,
-        exitReason: t.exitReason,
-        entryLiquidityUsd: snapshot?.liquidity?.usd ?? null,
-        entryValuationPnlPct: t.entryValuationPnlPct,
-        entryQuoteInAmount: t.entryQuoteInAmount,
-        entryQuoteOutAmount: t.entryQuoteOutAmount,
-        exitQuoteInAmount: t.exitQuoteInAmount,
-        exitQuoteOutAmount: t.exitQuoteOutAmount,
-        history: tradeHistoryStore.listForTrade(t.id),
-        live: {
-          mode: t.mode,
-          entrySignature: t.entrySignature,
-          exitSignature: t.exitSignature,
-          entryUsdcRaw: t.entryUsdcRaw,
-          entryTokensRaw: t.entryTokensRaw,
-          exitTokensRaw: t.exitTokensRaw,
-          exitUsdcRaw: t.exitUsdcRaw,
-          entryFeeLamports: t.entryFeeLamports,
-          exitFeeLamports: t.exitFeeLamports,
-          entryFeeUsd: t.entryFeeUsd,
-          exitFeeUsd: t.exitFeeUsd,
-          rentPaidLamports: t.rentPaidLamports,
-          rentReclaimedLamports: t.rentReclaimedLamports,
-          rentPaidUsd: t.rentPaidUsd,
-          rentReclaimedUsd: t.rentReclaimedUsd,
-          entrySolPriceUsd: t.entrySolPriceUsd,
-          exitSolPriceUsd: t.exitSolPriceUsd,
-          sellAttempts: t.sellAttempts,
-          failedSellFeesLamports: t.failedSellFeesLamports,
-          failedSellFeesUsd: t.failedSellFeesUsd,
-          proceedsUnknown: t.proceedsUnknown,
-        },
-      };
-    });
+    const detail = rows.map((t) => tradeRowToDetailRecord(t, tradeHistoryStore.listForTrade(t.id)));
     console.log(formatTradeDetail(detail));
     db.close();
     return;
