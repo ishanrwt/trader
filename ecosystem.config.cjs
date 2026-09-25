@@ -18,6 +18,7 @@ module.exports = {
       shutdown_with_message: true,
       kill_timeout: 150000,
       autorestart: true,
+      exp_backoff_restart_delay: 30000,
     },
   ],
 };
