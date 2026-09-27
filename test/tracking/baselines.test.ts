@@ -108,7 +108,7 @@ describe("migration 0009_post_exit_price_source", () => {
     db.prepare("INSERT INTO post_exit_tracks (trade_id, mint, exit_time, exit_price_usd, resolved) VALUES (1, 'M', 2, 0.00007067, 0)").run();
 
     runMigrations(db, MIGRATIONS);
-    expect(db.pragma("user_version", { simple: true })).toBe(9);
+    expect(db.pragma("user_version", { simple: true })).toBeGreaterThanOrEqual(9);
     const store = new PostExitTracksStore(db);
     expect(store.listAll()[0]).toMatchObject({ exitPriceUsd: 0.00007067, exitPriceSource: "entry_snapshot" });
     store.insert({ tradeId: 1, mint: "M", exitTime: 3, exitPriceUsd: 0.000005, exitPriceSource: "dexscreener_at_exit" });

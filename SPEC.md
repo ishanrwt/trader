@@ -52,7 +52,7 @@ It is not part of the Cloudflare Worker in `../trends`. Never modify anything in
 - Latest token profiles: `GET https://api.dexscreener.com/token-profiles/latest/v1` (reported limit about 60 requests/min).
 - Pair data for up to 30 tokens: `GET https://api.dexscreener.com/tokens/v1/solana/{addr1,addr2,...}` (reported limit about 300 requests/min).
 - Verify both against the current docs. The sibling Worker repo (`../trends/src/index.js`) contains working DexScreener code you may read for reference; this spec wins where they differ.
-- Our limiter stays under `DEX_PROFILES_MAX_PER_MIN` for profiles and `DEX_PAIRS_MAX_PER_MIN` for pair data (shared by discovery, liquidity checks, shadows and tracking). On a 429 or 5xx, back off with jitter.
+- Our limiter stays under `DEX_PROFILES_MAX_PER_MIN` for profiles and `DEX_PAIRS_MAX_PER_MIN` for pair data (shared by discovery, liquidity checks, shadows, tracking and price paths). On a 429 or 5xx, back off with jitter.
 - **Pair selection rule** (used everywhere a price or liquidity is needed for a mint): among a mint's pairs with `chainId` "solana" where `baseToken.address` equals that mint and `quoteToken.address` is in `ALLOWED_QUOTE_MINTS`, use the one with the highest `liquidity.usd`. Ignore all other pairs, including ones where the mint appears only as the quote token. DexScreener occasionally misprices pairs quoted against other tokens.
 
 ### Jupiter
@@ -273,9 +273,20 @@ Live trades also store: the entry and exit transaction signatures; the raw on-ch
 - Skipped tokens: by skip reason, the count, how many have a baseline price, and the median +15/+60 price change from that baseline (rows without one are left out).
 - **Go-live checklist** (paper trades, "as if live" view), each PASS or FAIL: closed trades ≥ `GOLIVE_MIN_TRADES`; first-to-last trade span ≥ `GOLIVE_MIN_DAYS` days; median net PnL % > `GOLIVE_MIN_MEDIAN_PNL_PCT`; total net PnL USD > `GOLIVE_MIN_TOTAL_PNL_USD`; p10 net PnL % ≥ `GOLIVE_MIN_P10_PNL_PCT`; no positions currently stuck. The checklist is information only: it never blocks live mode (sections 15 and 16.8).
 
+### 11.5 Price paths (data collection only)
+
+A price path is recorded for every mint that becomes READY, so exit rules and entry filters can later be replayed offline. Nothing here affects entries, exits, selection or shadows, and it never calls Jupiter: pair data comes from DexScreener through the shared `DEX_PAIRS_MAX_PER_MIN` limiter, with the section 3 pair selection rule, in batches of 30.
+
+- **Start**: at the mint's first READY, whether or not a shadow is created (independent of `SHADOW_MAX_OPEN`). One path per mint and mode; becoming READY again never starts another. At most `PATH_TRACK_MAX` paths record at once; a mint that becomes READY while that many are recording gets no path (it isn't started later, since a path must start at first READY), and the digest's health section shows "price paths: n recording, m skipped at cap (today)".
+- **Entry features**, stored once at first READY from the READY snapshot: the selected pair (JSON), `dexId`, pair age, top-1 and top-10 share, score and components. Also on the path: whether a position was opened for the mint (`selected`), and the round-trip loss and time of the latest sellability check for it, pass or fail (null if none ran); both are updated whenever they happen, even after recording has ended.
+- **Points**: the READY pair is the first point. Then a point every `PATH_FAST_SECONDS` for the first `PATH_FAST_WINDOW_MIN` minutes, and every `SHADOW_POLL_SECONDS` after that, until 60 minutes after first READY (`ends_at`); no point is recorded at or after `ends_at`, and the path is then marked done. The interval in force is the one for the moment a point is due, so the first slow-phase point comes `SHADOW_POLL_SECONDS` after the last fast one. Recording continues whatever happens to the mint's shadow or real position.
+- Each point stores t, `priceUsd`, `liquidity.usd`, `txns.m5.buys`, `txns.m5.sells` and `volume.m5` from the same pair. A **gap** row (all values null) is stored instead when the batch had no valid pair for the mint (`no_pair`) or the batch request failed (`fetch_failed`); neither stops the recording or the loop.
+- **Restarts**: paths whose `ends_at` is still ahead resume recording; the downtime shows as missing timestamps, not gap rows.
+- **Budget**: the recording loop runs every `PATH_FAST_SECONDS` and fetches only the paths that are due, batched together. At the `PATH_TRACK_MAX` cap with every path in its fast window, that's ⌈100/30⌉ = 4 requests per 5 s, 48/min. Together with everything else (pending rechecks, liquidity checks, shadows, skip and post-exit tracking, exit prices, SOL price: about 30/min in the worst case) that stays well under `DEX_PAIRS_MAX_PER_MIN`.
+
 ## 12. Storage
 
-SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `trade_history` (a closed trade's `position_history`, preserved rather than deleted), `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks per mode, virtual wallet), `events`. Phase 3 adds `tx_intents` (write-ahead intents, section 16.5) and `fee_losses` (fees of failed transactions, section 16.3), and extends `positions`, `trades`, `shadows` and `safety_cache` with the live fields sections 11.1, 11.2 and 16 need (signatures, raw amounts, token program, token account, decimals, sell attempts, fees spent, stuck state). Every intent and fee-loss row stores its mode. `positions` also carries the sellability loss, `dexId`, stop poll/confirmation values and the would-be-halt tag (section 11.1) until the trade is recorded. `shadows` has a `duplicate_of` column and a unique index on (mint, mode) over rows where it's null, and a `classification` column separate from the lifecycle `outcome` (section 11.2). `post_exit_tracks` records its exit price's source in `exit_price_source` (section 11.3). The `state` table also holds, per mode, the daily-loss halt's day and net loss, the loss-streak pause's start (time and streak), and which halt day and pause start were last alerted (section 9.1). The database files are gitignored.
+SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `trade_history` (a closed trade's `position_history`, preserved rather than deleted), `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks per mode, virtual wallet), `events`. Phase 3 adds `tx_intents` (write-ahead intents, section 16.5) and `fee_losses` (fees of failed transactions, section 16.3), and extends `positions`, `trades`, `shadows` and `safety_cache` with the live fields sections 11.1, 11.2 and 16 need (signatures, raw amounts, token program, token account, decimals, sell attempts, fees spent, stuck state). Every intent and fee-loss row stores its mode. `positions` also carries the sellability loss, `dexId`, stop poll/confirmation values and the would-be-halt tag (section 11.1) until the trade is recorded. `shadows` has a `duplicate_of` column and a unique index on (mint, mode) over rows where it's null, and a `classification` column separate from the lifecycle `outcome` (section 11.2). `post_exit_tracks` records its exit price's source in `exit_price_source` (section 11.3). Price paths (section 11.5) use `price_paths` (one row per mint and mode: times, status, entry features, `selected`, sellability) and `price_path_points` (t, price, liquidity, m5 buys/sells/volume, gap). The `state` table also holds, per mode, the daily-loss halt's day and net loss, the loss-streak pause's start (time and streak), and which halt day and pause start were last alerted (section 9.1). The database files are gitignored.
 
 ## 13. Configuration (.env)
 
@@ -406,6 +417,11 @@ SHADOW_POLL_SECONDS=15
 SHADOW_POOL_FEE_PCT=1
 SKIP_TRACK_MAX_PER_HOUR=60
 POST_EXIT_TRACK=true
+# Price paths (section 11.5, data collection only): at most this many recording at once
+PATH_TRACK_MAX=100
+# Price paths: seconds between points for the first PATH_FAST_WINDOW_MIN minutes after first READY (then SHADOW_POLL_SECONDS)
+PATH_FAST_SECONDS=5
+PATH_FAST_WINDOW_MIN=10
 
 # ---- Notifications ----
 DIGEST_INTERVAL_MINUTES=120

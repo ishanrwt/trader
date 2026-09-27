@@ -130,6 +130,10 @@ export const envSchema = z.object({
   SHADOW_POOL_FEE_PCT: numberField(1),
   SKIP_TRACK_MAX_PER_HOUR: intField(60),
   POST_EXIT_TRACK: boolField(true),
+  // Section 11.5: price paths (data collection only).
+  PATH_TRACK_MAX: intField(100),
+  PATH_FAST_SECONDS: numberField(5),
+  PATH_FAST_WINDOW_MIN: numberField(10),
 
   // ---- Notifications ----
   DIGEST_INTERVAL_MINUTES: numberField(120),

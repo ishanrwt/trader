@@ -78,6 +78,8 @@ import { paperEntryFill, paperExitFill, shouldWriteOff } from "./executor/paper.
 import { shadowStep, shadowValue } from "./tracking/shadows.js";
 import { createShadowOnReady, markShadowSelected, markShadowUnsellable } from "./tracking/shadowCreation.js";
 import { dexPriceAtExit } from "./tracking/exitPrice.js";
+import { capSkipsToday, recordCapSkip, startPricePath, tickPricePaths, type PricePathConfig, type ReadySnapshot } from "./tracking/pricePaths.js";
+import { PricePathsStore } from "./storage/pricePaths.js";
 import { dueOffsetMinutes as skipDueOffset, isSkipTrackResolved } from "./tracking/skipTracking.js";
 import { dueOffsetMinutes as postExitDueOffset, isPostExitTrackResolved } from "./tracking/postExit.js";
 import { formatClockInZone, tradingDayKey } from "./time.js";
@@ -211,6 +213,16 @@ async function main(): Promise<void> {
   const tradesStore = new TradesStore(db);
   const tradeHistoryStore = new TradeHistoryStore(db);
   const shadowsStore = new ShadowsStore(db);
+  const pricePathsStore = new PricePathsStore(db);
+  // Section 11.5: price paths (data collection only; DexScreener through the shared pairs limiter, never Jupiter).
+  const pathCfg: PricePathConfig = {
+    mode: config.MODE,
+    maxRecording: config.PATH_TRACK_MAX,
+    fastSeconds: config.PATH_FAST_SECONDS,
+    fastWindowMin: config.PATH_FAST_WINDOW_MIN,
+    slowSeconds: config.SHADOW_POLL_SECONDS,
+    allowedQuoteMints: config.ALLOWED_QUOTE_MINTS,
+  };
   const skipTracksStore = new SkipTracksStore(db);
   const postExitTracksStore = new PostExitTracksStore(db);
   const safetyCacheStore = new SafetyCacheStore(db);
@@ -421,6 +433,16 @@ async function main(): Promise<void> {
       () => shadowsSkippedForCap++,
     );
     if (result === "exists") logger.debug("Mint READY again; it already has its shadow", { mint });
+
+    // Section 11.5: its price path starts at the same first READY, independent of the shadow and SHADOW_MAX_OPEN.
+    const readyRow = pendingStore.listReady().find((r) => r.mint === mint);
+    const snapshot = readyRow?.snapshot ? (JSON.parse(readyRow.snapshot) as ReadySnapshot) : null;
+    const now = Date.now();
+    const path = startPricePath(pricePathsStore, pathCfg, { mint, pair, snapshot, now });
+    if (path === "cap") {
+      recordCapSkip(stateStore, config.MODE, now, config.TRADING_DAY_TZ);
+      logger.info("Price path not started: PATH_TRACK_MAX paths already recording", { mint, max: config.PATH_TRACK_MAX });
+    }
   }
 
   const phase2GateDeps: Phase2GateDeps = {
@@ -625,7 +647,10 @@ async function main(): Promise<void> {
         if (!c || c.expiresAt <= now) return undefined;
         return c.result;
       },
-      setSellabilityCache: (mint, sizeUsd, result) => sellabilityCache.set(sellabilityCacheKey(mint, sizeUsd), { result, expiresAt: now + 10 * 60_000 }),
+      setSellabilityCache: (mint, sizeUsd, result) => {
+        sellabilityCache.set(sellabilityCacheKey(mint, sizeUsd), { result, expiresAt: now + 10 * 60_000 });
+        pricePathsStore.setSellability(mint, config.MODE, result.roundTripLossPct, result.checkedAt); // section 11.5: every fresh measurement
+      },
       checkSellability: async (mint, sizeUsd) => {
         try {
           await acquireEntryLane();
@@ -1011,6 +1036,7 @@ async function main(): Promise<void> {
     pendingStore.removePending(candidate.mint); // bought (section 4)
 
     markShadowSelected(shadowsStore, candidate.mint, config.MODE); // section 11.2: even if the shadow already closed
+    pricePathsStore.markSelected(candidate.mint, config.MODE); // section 11.5
 
     funnel.entered++;
     funnel.scoreRangeOfEntries = funnel.scoreRangeOfEntries
@@ -1260,6 +1286,11 @@ async function main(): Promise<void> {
   });
 
   // ---- Shadow polling (section 11.2): DexScreener only, never Jupiter ----
+  // ---- Price paths (section 11.5): every PATH_FAST_SECONDS; each path is fetched only when due ----
+  void runLoop("price-paths", config.PATH_FAST_SECONDS * 1000, logger, signal, async () => {
+    await tickPricePaths(pricePathsStore, pathCfg, Date.now(), (mints) => dexClient.getPairs(SOLANA_CHAIN_ID, mints));
+  });
+
   void runLoop("shadow-poll", config.SHADOW_POLL_SECONDS * 1000, logger, signal, async () => {
     if (!config.SHADOW_ENABLED) return;
     const now = Date.now();
@@ -1507,6 +1538,7 @@ async function main(): Promise<void> {
         scoreRangeOfEntries: funnel.scoreRangeOfEntries,
       },
       risk: { dailyLossUsd: realizedNetPnlToday(now) + unrealizedLossSum(), dailyLossCapUsd: config.MAX_DAILY_LOSS_USD },
+      pricePaths: { recording: pricePathsStore.countRecording(), skippedToday: capSkipsToday(stateStore, config.MODE, now, config.TRADING_DAY_TZ) },
       health: {
         dexScreenerErrors: health.dexScreenerErrors,
         rpcErrors: health.rpcErrors,

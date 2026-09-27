@@ -68,6 +68,8 @@ export interface DigestInput {
     dailyLossUsd: number;
     dailyLossCapUsd: number;
   };
+  /** Section 11.5: price paths recording now, and mints skipped because PATH_TRACK_MAX was reached (today). */
+  pricePaths?: { recording: number; skippedToday: number };
   health: {
     dexScreenerErrors: number;
     rpcErrors: number;
@@ -202,6 +204,7 @@ export function buildDigest(input: DigestInput): string {
       `peak ${input.health.jupiterRequestsPerMinPeak}, 429s: ${input.health.jupiter429s}`,
   );
   lines.push(`  Deferred entry checks: ${input.health.deferredEntryChecks}`);
+  if (input.pricePaths) lines.push(`  price paths: ${input.pricePaths.recording} recording, ${input.pricePaths.skippedToday} skipped at cap (today)`);
   if (input.live) {
     const tx = input.live.tx;
     lines.push(`  RPC requests this window: ${input.live.rpcRequests}`);
