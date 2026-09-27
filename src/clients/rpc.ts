@@ -49,6 +49,33 @@ export class SolanaRpcClient {
     return this.call("getMultipleAccounts", [pubkeys, { encoding: "jsonParsed" }]);
   }
 
+  // ---- Section 11.6 rug-risk features (read-only, data collection only) ----
+
+  /** Raw account bytes (base64), for decoding program accounts such as PumpSwap pools. 1 credit. */
+  async getAccountInfoBase64(pubkey: string): Promise<unknown> {
+    return this.call("getAccountInfo", [pubkey, { encoding: "base64" }]);
+  }
+
+  /** 10 credits on Helius. */
+  async getProgramAccounts(programId: string, config: Record<string, unknown>): Promise<unknown> {
+    return this.call("getProgramAccounts", [programId, config]);
+  }
+
+  /** Newest first; up to `limit` (max 1000) signatures older than `before`. 1 credit. */
+  async getSignaturesForAddress(address: string, opts: { limit: number; before?: string }): Promise<unknown> {
+    return this.call("getSignaturesForAddress", [address, opts]);
+  }
+
+  /** 1 credit. Version 1 is required: newer transactions are rejected with version 0 (-32015). */
+  async getTransactionJsonParsed(signature: string): Promise<unknown> {
+    return this.call("getTransaction", [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 }]);
+  }
+
+  /** 1 credit. */
+  async getTokenAccountsByOwnerForMint(owner: string, mint: string): Promise<unknown> {
+    return this.call("getTokenAccountsByOwner", [owner, { mint }, { encoding: "jsonParsed" }]);
+  }
+
   private async call<T>(method: string, params: unknown[]): Promise<T> {
     await this.opts.limiter.acquire();
     this.idCounter += 1;

@@ -1,6 +1,8 @@
 import { equalSizeBuckets, maxDrawdown, mean, median, pearsonCorrelation, percentile } from "./stats.js";
 import type { TradeRow } from "../storage/trades.js";
 import { replayAsIfLive, type ReplayConfig } from "./asIfLive.js";
+import { formatRugSection } from "./rugReport.js";
+import type { MintFeaturesRow } from "../storage/mintFeatures.js";
 
 export interface TradeRecord {
   mode: "paper" | "live";
@@ -391,6 +393,8 @@ export function formatReport(input: {
   shadows?: readonly ShadowRecord[];
   /** This mode's post-exit tracks for the report period (section 11.4 exited too early). */
   postExit?: readonly PostExitRecord[];
+  /** This mode's rug-risk features for the report period (section 11.6). */
+  rugFeatures?: readonly MintFeaturesRow[];
 }): string {
   const totals = computeTotals(input.trades, input.feeLosses ?? []);
   const byReason = breakdownByExitReason(input.trades);
@@ -441,6 +445,7 @@ export function formatReport(input: {
   );
   if (input.shadows) lines.push(...formatShadowSection(input.shadows, input.trades));
   if (input.postExit) lines.push(...formatExitedTooEarly(exitedTooEarly(input.postExit)));
+  if (input.rugFeatures) lines.push(...formatRugSection(input.rugFeatures, input.trades));
   const fmtSkipPct = (v: number | null): string => (v === null ? "n/a" : `${v.toFixed(1)}%`);
   lines.push(
     `Skip reasons (median change from the price at skip; only rows with that baseline): ${

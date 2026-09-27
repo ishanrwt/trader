@@ -3,6 +3,8 @@ import { loadEnv } from "../config/loadEnv.js";
 import { loadReportConfig, ReportConfigError } from "../config/reportConfig.js";
 import { formatReport, formatTradeDetail, tradeRowToDetailRecord, tradeRowToRecord, type ReplayableTradeRecord } from "./index.js";
 import { postExitRecordsFor } from "./postExitRecords.js";
+import { rugFeaturesFor } from "./rugReport.js";
+import { MintFeaturesStore } from "../storage/mintFeatures.js";
 import { PostExitTracksStore } from "../storage/postExitTracks.js";
 import { buildWindowsReport } from "./windows.js";
 import { tradingDayKey } from "../time.js";
@@ -128,6 +130,7 @@ function main(): void {
         ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) }
         : {}),
       ...(opts.mode ? {} : { modeLabel: mode.toUpperCase() }),
+      rugFeatures: rugFeaturesFor(new MintFeaturesStore(db).listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       postExit: postExitRecordsFor(new PostExitTracksStore(db).listAll(), tradesStore.listAll(), { mode, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       shadows: shadowRecordsFor(new ShadowsStore(db).listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       // Section 11.4: paper also gets the "as if live" view, and the go-live checklist uses it.

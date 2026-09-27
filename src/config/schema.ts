@@ -134,6 +134,12 @@ export const envSchema = z.object({
   PATH_TRACK_MAX: intField(100),
   PATH_FAST_SECONDS: numberField(5),
   PATH_FAST_WINDOW_MIN: numberField(10),
+  // Section 11.6: rug-risk features (data collection only).
+  RUG_FEATURES_ENABLED: boolField(true),
+  RUG_FEATURES_MAX_CREDITS_PER_DAY: intField(10000),
+  SNIPER_SLOTS: intField(3),
+  SNIPER_MAX_PAGES: intField(5),
+  RUGCHECK_ENABLED: boolField(false),
 
   // ---- Notifications ----
   DIGEST_INTERVAL_MINUTES: numberField(120),

@@ -64,7 +64,12 @@ It is not part of the Cloudflare Worker in `../trends`. Never modify anything in
 ### Solana RPC
 
 - `SOLANA_RPC_URL`, a keyed provider URL (for example Helius's free plan: 10 requests/s overall, `sendTransaction` 1/s, `simulateTransaction` shares the overall limit, 1M credits/month). Phases 1-2 only make read calls: `getAccountInfo` (jsonParsed), `getTokenLargestAccounts`, `getTokenSupply`, `getMultipleAccounts`. Limited by `RPC_MAX_RPS`.
+- Rug-risk feature collection (section 11.6, both modes, read-only) adds `getAccountInfo` (base64), `getProgramAccounts`, `getSignaturesForAddress`, `getTransaction` (jsonParsed, `maxSupportedTransactionVersion: 1`) and `getTokenAccountsByOwner`, through the same `RPC_MAX_RPS` read lane. Helius credit costs: 1 per standard call, 10 per `getProgramAccounts`.
 - Phase 3 adds, in live mode and `smoke-live` only: `simulateTransaction`, `sendTransaction`, `getSignatureStatuses`, `getTransaction`, `getBlockHeight`, `getLatestBlockhash`, `getTokenAccountsByOwner`. Budgets and limits are in section 16.10.
+
+### RugCheck (optional, `RUGCHECK_ENABLED`, default off)
+
+- `GET https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary`: no authentication per RugCheck's published Swagger spec; fields used: `score`, `score_normalised`, `lpLockedPct`, `risks`. The spec lists a 429 "Rate limit exceeded" response but no number, and no API terms were found, so it is off by default. When on: one request per READY mint, no retries, a descriptive User-Agent; any failure records null.
 
 ### Telegram
 
@@ -270,6 +275,7 @@ Live trades also store: the entry and exit transaction signatures; the raw on-ch
 - Score: results by score quintile; correlation of each score component with net PnL.
 - Shadows (this mode's, for the report period by the trading day of the shadow's entry; excluding those marked `duplicate_of`, section 11.2): selected vs unselected over closed shadows with PnL (count, win rate, median and mean net PnL in % and USD, p10), then how many are "no data" (closed without PnL), still open, and unsellable (excluded). Shadow vs actual for selected mints: each selected shadow with PnL is paired with its mint's first trade in the same mode that entered at or after the shadow; the report prints the number of pairs, the mean absolute difference in net PnL %, the mean signed difference (shadow − actual; positive means the shadow method is optimistic) and the correlation.
 - Exited too early, separately at +15 and at +60 minutes: of the trades with a valid exit price (section 11.3) and a reading at that horizon, the share whose price then exceeded the exit price, and the median % by which it did among those; plus how many trades were left out for lack of a valid exit price.
+- Rug-risk features (section 11.6): for each feature, how often it is null among the mints recorded in the period, by reason code; quartiles over the period's trades (LP burned %, holder count, sniper share, creator holding %, RugCheck score, pool age); breakdowns by LP status and by pump.fun migration.
 - Skipped tokens: by skip reason, the count, how many have a baseline price, and the median +15/+60 price change from that baseline (rows without one are left out).
 - **Go-live checklist** (paper trades, "as if live" view), each PASS or FAIL: closed trades ≥ `GOLIVE_MIN_TRADES`; first-to-last trade span ≥ `GOLIVE_MIN_DAYS` days; median net PnL % > `GOLIVE_MIN_MEDIAN_PNL_PCT`; total net PnL USD > `GOLIVE_MIN_TOTAL_PNL_USD`; p10 net PnL % ≥ `GOLIVE_MIN_P10_PNL_PCT`; no positions currently stuck. The checklist is information only: it never blocks live mode (sections 15 and 16.8).
 
@@ -284,9 +290,22 @@ A price path is recorded for every mint that becomes READY, so exit rules and en
 - **Restarts**: paths whose `ends_at` is still ahead resume recording; the downtime shows as missing timestamps, not gap rows.
 - **Budget**: the recording loop runs every `PATH_FAST_SECONDS` and fetches only the paths that are due, batched together. At the `PATH_TRACK_MAX` cap with every path in its fast window, that's ⌈100/30⌉ = 4 requests per 5 s, 48/min. Together with everything else (pending rechecks, liquidity checks, shadows, skip and post-exit tracking, exit prices, SOL price: about 30/min in the worst case) that stays well under `DEX_PAIRS_MAX_PER_MIN`.
 
+### 11.6 Rug-risk features (data collection only)
+
+Recorded once per mint and mode at its first READY, in `mint_features` (independent of the price-path cap; joins `price_paths` on mint and mode), so entry filters can later be evaluated offline. Nothing here is a gate check or is read by selection, entries or exits. Collection runs in the background after READY, one mint at a time, on the RPC read lane; it never delays the gate. Every lookup is separate and fails safe: a failure stores null plus a reason code (`rpc_error`, `budget`, `too_many_txs`, `unsupported`, `layout_unverified`, `concentrated_or_position`, `not_found`, `implausible`, `no_creator`, `disabled`). Account layouts come from pump.fun's published IDLs (`idl/pump.json`, `idl/pump_amm.json` in pump-public-docs).
+
+- **Pool and pump.fun migration**: the selected pair's address is the pool account; its owner program identifies the pool type. A pump.fun migration is a completed bonding curve (PDA of seeds `"bonding-curve"` + mint under the pump program `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`, `complete = true`) whose liquidity is in the canonical PumpSwap pool (`index` 0, the index pump.fun's `migrate` uses). Pool age at READY is the price path's pair age (DexScreener `pairCreatedAt`).
+- **LP status, PumpSwap** (`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`): the pool's `lp_supply` (the LP amount minted; burns don't reduce it) against the LP mint's current supply. Burned % = 1 − current supply ÷ `lp_supply`; no PumpSwap LP locker is documented, so locked = 0; withdrawable = the rest. Status `burned` at ≥ 99% burned, else `withdrawable`. Both raw numbers are stored. `lp_supply` = 0, or more LP circulating than `lp_supply`, records `implausible`. **Raydium and Meteora**: not decoded yet (their account layouts couldn't be verified from their docs): `layout_unverified`, or `concentrated_or_position` for pools without a fungible LP token (CLMM, DLMM, DAMM v2 / `DYN2`).
+- **Holder count**: non-zero token accounts for the mint, from `getProgramAccounts` on its token program with a mint filter (and the 165-byte size filter for SPL Token; Token-2022 accounts can be longer), reading only the amount.
+- **Sniper share** (pump.fun tokens only): the bonding curve is created when the token launches on pump.fun; the PumpSwap pool only comes later, at migration. The sniper share measures buys in the curve's first `SNIPER_SLOTS` slots after launch: tokens received in successful transactions of those slots by any account other than the curve itself and the PumpSwap pool, as a % of total supply; this includes the creator's own buy in the launch transaction. The curve's signatures are paged back to launch (1000 per page, at most `SNIPER_MAX_PAGES` pages, else `too_many_txs`); at most 40 early transactions are read (`sniper_capped` marks a lower bound). A share over 100% records `implausible`. When a curve sells out within the window, its remainder moving into the pool's vault is not a buy.
+- **Creator's current holding**: the PumpSwap pool's `coin_creator` if set, else the bonding curve's `creator`; their balance of the mint as a % of supply. No creator (non-pump.fun tokens) records `no_creator`.
+- **Creator history**: not recorded (no free, reliable source).
+- **RugCheck** (section 3), only when `RUGCHECK_ENABLED`.
+- **Credits**: a typical PumpSwap mint uses about 20 Helius credits (pool 1, curve 1, LP supply 1, holders 10, signature pages 1+, early transactions up to 40, creator 1); about 76k a month at 126 READY mints a day. `RUG_FEATURES_MAX_CREDITS_PER_DAY` caps the collector per mode and trading day: once it can't fit a lookup's worst case, the holder count and sniper share record `budget`.
+
 ## 12. Storage
 
-SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `trade_history` (a closed trade's `position_history`, preserved rather than deleted), `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks per mode, virtual wallet), `events`. Phase 3 adds `tx_intents` (write-ahead intents, section 16.5) and `fee_losses` (fees of failed transactions, section 16.3), and extends `positions`, `trades`, `shadows` and `safety_cache` with the live fields sections 11.1, 11.2 and 16 need (signatures, raw amounts, token program, token account, decimals, sell attempts, fees spent, stuck state). Every intent and fee-loss row stores its mode. `positions` also carries the sellability loss, `dexId`, stop poll/confirmation values and the would-be-halt tag (section 11.1) until the trade is recorded. `shadows` has a `duplicate_of` column and a unique index on (mint, mode) over rows where it's null, and a `classification` column separate from the lifecycle `outcome` (section 11.2). `post_exit_tracks` records its exit price's source in `exit_price_source` (section 11.3). Price paths (section 11.5) use `price_paths` (one row per mint and mode: times, status, entry features, `selected`, sellability) and `price_path_points` (t, price, liquidity, m5 buys/sells/volume, gap). The `state` table also holds, per mode, the daily-loss halt's day and net loss, the loss-streak pause's start (time and streak), and which halt day and pause start were last alerted (section 9.1). The database files are gitignored.
+SQLite with versioned migrations. Suggested tables: `seen_mints`, `pending`, `positions`, `position_history`, `trades`, `trade_history` (a closed trade's `position_history`, preserved rather than deleted), `shadows`, `skip_tracks`, `post_exit_tracks`, `safety_cache`, `state` (kill, pause, halts, streaks per mode, virtual wallet), `events`. Phase 3 adds `tx_intents` (write-ahead intents, section 16.5) and `fee_losses` (fees of failed transactions, section 16.3), and extends `positions`, `trades`, `shadows` and `safety_cache` with the live fields sections 11.1, 11.2 and 16 need (signatures, raw amounts, token program, token account, decimals, sell attempts, fees spent, stuck state). Every intent and fee-loss row stores its mode. `positions` also carries the sellability loss, `dexId`, stop poll/confirmation values and the would-be-halt tag (section 11.1) until the trade is recorded. `shadows` has a `duplicate_of` column and a unique index on (mint, mode) over rows where it's null, and a `classification` column separate from the lifecycle `outcome` (section 11.2). `post_exit_tracks` records its exit price's source in `exit_price_source` (section 11.3). Price paths (section 11.5) use `price_paths` (one row per mint and mode: times, status, entry features, `selected`, sellability) and `price_path_points` (t, price, liquidity, m5 buys/sells/volume, gap). Rug-risk features (section 11.6) use `mint_features`: one row per mint and mode with every feature, the raw PumpSwap LP numbers, a JSON map of reason codes for null features, and the credits used. The `state` table also holds, per mode, the daily-loss halt's day and net loss, the loss-streak pause's start (time and streak), and which halt day and pause start were last alerted (section 9.1). The database files are gitignored.
 
 ## 13. Configuration (.env)
 
@@ -422,6 +441,16 @@ PATH_TRACK_MAX=100
 # Price paths: seconds between points for the first PATH_FAST_WINDOW_MIN minutes after first READY (then SHADOW_POLL_SECONDS)
 PATH_FAST_SECONDS=5
 PATH_FAST_WINDOW_MIN=10
+# Rug-risk features (section 11.6, data collection only; read-only RPC, recorded once per READY mint)
+RUG_FEATURES_ENABLED=true
+# Helius credits the collector may spend per trading day; costly lookups record "budget" once reached
+RUG_FEATURES_MAX_CREDITS_PER_DAY=10000
+# Sniper share: buys in the bonding curve's first SNIPER_SLOTS slots after launch
+SNIPER_SLOTS=3
+# Pages of 1000 curve signatures read to reach the launch; more records too_many_txs
+SNIPER_MAX_PAGES=5
+# Optional third-party report (api.rugcheck.xyz, undocumented rate limits and terms)
+RUGCHECK_ENABLED=false
 
 # ---- Notifications ----
 DIGEST_INTERVAL_MINUTES=120

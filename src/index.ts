@@ -45,6 +45,7 @@ import {
 } from "./notify/urgent.js";
 import { computeTotals, formatReport, formatWouldBlockCounts, tradeRowToRecord, type ReplayableTradeRecord } from "./report/index.js";
 import { postExitRecordsFor } from "./report/postExitRecords.js";
+import { rugFeaturesFor } from "./report/rugReport.js";
 import { replayAsIfLive, type ReplayConfig } from "./report/asIfLive.js";
 import { shadowRecordsFor } from "./report/shadowRecords.js";
 import { checkKillSwitch, perModeKey, realizedNetPnlForDay, unrealizedLossForMode } from "./risk/index.js";
@@ -80,6 +81,8 @@ import { createShadowOnReady, markShadowSelected, markShadowUnsellable } from ".
 import { dexPriceAtExit } from "./tracking/exitPrice.js";
 import { capSkipsToday, recordCapSkip, startPricePath, tickPricePaths, type PricePathConfig, type ReadySnapshot } from "./tracking/pricePaths.js";
 import { PricePathsStore } from "./storage/pricePaths.js";
+import { MintFeaturesStore } from "./storage/mintFeatures.js";
+import { collectRugFeatures, CreditMeter, makeRugCheck, makeRugRpc } from "./tracking/rugFeatures.js";
 import { dueOffsetMinutes as skipDueOffset, isSkipTrackResolved } from "./tracking/skipTracking.js";
 import { dueOffsetMinutes as postExitDueOffset, isPostExitTrackResolved } from "./tracking/postExit.js";
 import { formatClockInZone, tradingDayKey } from "./time.js";
@@ -214,6 +217,7 @@ async function main(): Promise<void> {
   const tradeHistoryStore = new TradeHistoryStore(db);
   const shadowsStore = new ShadowsStore(db);
   const pricePathsStore = new PricePathsStore(db);
+  const mintFeaturesStore = new MintFeaturesStore(db);
   // Section 11.5: price paths (data collection only; DexScreener through the shared pairs limiter, never Jupiter).
   const pathCfg: PricePathConfig = {
     mode: config.MODE,
@@ -412,6 +416,10 @@ async function main(): Promise<void> {
   }
 
   let shadowsSkippedForCap = 0;
+  // Section 11.6: read-only RPC through the shared limiter; the optional RugCheck call is off by default.
+  const rugRpc = makeRugRpc(rpcClient);
+  const rugCheck = makeRugCheck({ logger });
+  let rugQueue: Promise<void> = Promise.resolve();
 
   // Section 11.2: one shadow per mint and mode, at its first READY with room under SHADOW_MAX_OPEN.
   function onNewlyReady(mint: string, pair: DexPair): void {
@@ -442,6 +450,26 @@ async function main(): Promise<void> {
     if (path === "cap") {
       recordCapSkip(stateStore, config.MODE, now, config.TRADING_DAY_TZ);
       logger.info("Price path not started: PATH_TRACK_MAX paths already recording", { mint, max: config.PATH_TRACK_MAX });
+    }
+
+    // Section 11.6: rug-risk features, collected in the background, one mint at a time; never awaited here.
+    if (config.RUG_FEATURES_ENABLED && !mintFeaturesStore.has(mint, config.MODE)) {
+      const input = { mint, pairAddress: pair.pairAddress, pairLabels: (pair as DexPair & { labels?: string[] }).labels ?? [], tokenProgram: safetyCacheStore.getMintInfo(mint)?.tokenProgram ?? null };
+      rugQueue = rugQueue
+        .then(async () => {
+          const features = await collectRugFeatures(
+            {
+              rpc: rugRpc,
+              meter: new CreditMeter(stateStore, config.MODE, config.RUG_FEATURES_MAX_CREDITS_PER_DAY, config.TRADING_DAY_TZ, () => Date.now()),
+              ...(config.RUGCHECK_ENABLED ? { rugcheck: rugCheck } : {}),
+              sniperSlots: config.SNIPER_SLOTS,
+              sniperMaxPages: config.SNIPER_MAX_PAGES,
+            },
+            input,
+          );
+          mintFeaturesStore.insertIfAbsent(mint, config.MODE, Date.now(), features);
+        })
+        .catch((err: unknown) => logger.warn("Rug-risk feature collection failed; nothing recorded for this mint", { mint, error: String(err) }));
     }
   }
 
@@ -1420,6 +1448,7 @@ async function main(): Promise<void> {
       trades: tradeRowsToRecords(mode, opts.from, opts.to),
       ...(mode === "live" ? { feeLosses: feeLossesStore.listAll({ mode: "live", ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }) } : {}),
       paperTrades: tradeRowsToRecords("paper"),
+      rugFeatures: rugFeaturesFor(mintFeaturesStore.listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       postExit: postExitRecordsFor(postExitTracksStore.listAll(), tradesStore.listAll(), { mode, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       shadows: shadowRecordsFor(shadowsStore.listAll(), { mode, timeZone: config.TRADING_DAY_TZ, ...(opts.from ? { from: opts.from } : {}), ...(opts.to ? { to: opts.to } : {}) }),
       ...(mode === "paper"
