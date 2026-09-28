@@ -109,6 +109,14 @@ export class PricePathsStore {
     return info.changes === 1 ? Number(info.lastInsertRowid) : null;
   }
 
+  /** Every path, oldest first (offline replay). */
+  listAll(mode?: string): PricePathRow[] {
+    const rows = mode === undefined
+      ? this.db.prepare(`${SELECT} ORDER BY p.started_at ASC, p.id ASC`).all()
+      : this.db.prepare(`${SELECT} WHERE p.mode = ? ORDER BY p.started_at ASC, p.id ASC`).all(mode);
+    return (rows as PathDb[]).map(fromDb);
+  }
+
   get(id: number): PricePathRow | undefined {
     const r = this.db.prepare(`${SELECT} WHERE p.id = ?`).get(id) as PathDb | undefined;
     return r ? fromDb(r) : undefined;

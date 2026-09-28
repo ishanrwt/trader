@@ -1,0 +1,9 @@
+{
+  "baseline": { "overrides": {} },
+  "variants": [
+    { "name": "stop_10", "exit": { "STOP_LOSS_PCT": 10 } },
+    { "name": "target_25_trail_6", "exit": { "TARGET_PROFIT_PCT": 25, "TRAIL_PCT": 6 } },
+    { "name": "survive_60s", "filters": { "survivalDelaySec": 60 } },
+    { "name": "low_snipers_burned_lp", "filters": { "maxSniperSharePct": 20, "lpStatus": ["burned"], "nullPolicy": "pass" } }
+  ]
+}

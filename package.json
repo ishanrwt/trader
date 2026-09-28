@@ -9,6 +9,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "report": "tsx src/report/cli.ts",
+    "replay": "tsx src/replay/cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "smoke-live": "tsx src/live/smokeCli.ts"

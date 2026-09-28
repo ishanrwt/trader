@@ -24,6 +24,7 @@ import { SlidingWindowLimiter } from "./limiters/slidingWindow.js";
 import { createLogger, type Logger, type LogLevel } from "./logger/index.js";
 import { pollOpenPositions, triggerFireAndForget, type PollPositionInput } from "./monitor/index.js";
 import { finalPeakPnl, initialExitState, type ExitState, type ExitStateMachineConfig } from "./monitor/stateMachine.js";
+import { exitConfigFromEnv } from "./monitor/exitConfig.js";
 import { logStopConfirm, stopCloseFields } from "./monitor/stopConfirm.js";
 import {
   CONSECUTIVE_ERRORS_KEY,
@@ -268,25 +269,7 @@ async function main(): Promise<void> {
   const funnel = emptyFunnelCounters();
   const health = emptyHealthCounters();
 
-  const exitCfg: ExitStateMachineConfig = {
-    stopLossPct: config.STOP_LOSS_PCT,
-    extraTargetPct: config.EXTRA_TARGET_PCT,
-    maxTargetExtensions: config.MAX_TARGET_EXTENSIONS,
-    holdMinutes: config.HOLD_MINUTES,
-    fastGainPct: config.FAST_GAIN_PCT,
-    fastWindowMinutes: config.FAST_WINDOW_MINUTES,
-    fastMinHistorySec: config.FAST_MIN_HISTORY_SEC,
-    fastConfirmPolls: config.FAST_CONFIRM_POLLS,
-    maxTimerRestarts: config.MAX_TIMER_RESTARTS,
-    maxTotalHoldMinutes: config.MAX_TOTAL_HOLD_MINUTES,
-    trailPct: config.TRAIL_PCT,
-    breakevenTriggerPct: config.BREAKEVEN_TRIGGER_PCT,
-    breakevenFloorPct: config.BREAKEVEN_FLOOR_PCT,
-    flatBandPct: config.FLAT_BAND_PCT,
-    liqDropExitPct: config.LIQ_DROP_EXIT_PCT,
-    liqDropConfirmReads: config.LIQ_DROP_CONFIRM_READS,
-    noRouteExitSec: config.NO_ROUTE_EXIT_SEC,
-  };
+  const exitCfg: ExitStateMachineConfig = exitConfigFromEnv(config);
   const paperFillCfg = { latencySec: config.PAPER_LATENCY_SEC, extraSlippagePct: config.PAPER_EXTRA_SLIPPAGE_PCT, feeUsdPerTx: config.PAPER_FEE_USD_PER_TX };
 
   // ---- In-memory caches / trackers (short-lived; a restart naturally invalidates them) ----
